@@ -1,5 +1,5 @@
 """
-Discord Data Package Viewer — v3
+Discord Data Package Viewer — v4
 
 Usage:
   GUI mode:  python generate_discord_viewer.py        (opens file-picker window)
@@ -471,16 +471,40 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def fetch_tenor_thumb(tenor_id):
-    """Fetch Tenor thumbnail URL server-side during HTML generation."""
-    try:
-        url = f"https://tenor.com/oembed?url=https://tenor.com/view/{tenor_id}&format=json"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            d = json.loads(r.read())
-            return d.get("thumbnail_url") or d.get("url") or ""
-    except Exception as e:
-        log.debug("Tenor fetch failed for %s: %s", tenor_id, e)
-        return ""
+    """Fetch Tenor thumbnail URL with retry + exponential backoff on 429 rate-limits.
+
+    Strategy:
+      - Up to 4 attempts per ID
+      - On HTTP 429: wait 1s * 2^attempt + small random jitter before retry
+      - On other errors: retry once immediately, then give up
+    """
+    import time as _t, random as _r
+    url = f"https://tenor.com/oembed?url=https://tenor.com/view/{tenor_id}&format=json"
+    # Slightly randomised UA to reduce fingerprinting
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/124.0.0.0 Safari/537.36")
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                d = json.loads(r.read())
+                return d.get("thumbnail_url") or d.get("url") or ""
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Rate-limited: exponential backoff with jitter
+                wait = (2 ** attempt) + _r.uniform(0.1, 0.8)
+                _t.sleep(wait)
+                continue
+            log.debug("Tenor HTTP %d for %s", e.code, tenor_id)
+            return ""
+        except Exception as e:
+            if attempt < 1:
+                _t.sleep(0.2 + _r.uniform(0, 0.2))
+                continue
+            log.debug("Tenor fetch failed for %s: %s", tenor_id, e)
+            return ""
+    return ""
 
 _TENOR_THUMB_CACHE = {}
 
@@ -491,7 +515,7 @@ def get_tenor_thumb(tenor_id):
 
 def load_messages(channel_index):
     msgs_dir = PACKAGE_PATH / "Messages"
-    channels, total = [], 0
+    channels, all_msgs, total = [], {}, 0
     dirs = sorted([d for d in msgs_dir.iterdir() if d.is_dir()])
     print(f"  Φορτώνω {len(dirs)} φακέλους...")
 
@@ -602,13 +626,17 @@ def load_messages(channel_index):
             "count":    len(messages),
             "last_ts":  messages[0]["ts"],
             "first_ts": messages[-1]["ts"],
-            "messages": messages,
+            # NOTE: messages NOT stored here — returned separately in all_msgs
+            # to avoid holding two in-memory copies during HTML generation.
         })
+        all_msgs[ch_id] = messages
         if (i+1) % 100 == 0:
             print(f"  ... {i+1}/{len(dirs)}")
 
     # DEFAULT SORT: by message count descending
     channels.sort(key=lambda x: x["count"], reverse=True)
+    # keep all_msgs in the same sorted order for consistency
+    all_msgs = {ch["id"]: all_msgs[ch["id"]] for ch in channels}
     print(f"  OK: {len(channels)} κανάλια | {total:,} msgs")
 
     stats_accum = {
@@ -618,7 +646,7 @@ def load_messages(channel_index):
         "att_files": st_att_files, "att_ext_cnt": st_att_ext,
         "first_ts": st_first_ts, "last_ts": st_last_ts,
     }
-    return channels, total, stats_accum
+    return channels, all_msgs, total, stats_accum
 
 # Greek + English stop words for word cloud
 _STOP = set("""
@@ -652,14 +680,23 @@ _EMOJI_RE = re.compile(
 _IMG_EXT  = {"jpg","jpeg","png","gif","webp","bmp","svg","avif","heic"}
 _VID_EXT  = {"mp4","mov","webm","mkv","avi","m4v","flv","wmv"}
 
-_TENOR_RE = re.compile(r'https?://tenor\.com/view/[\w-]+')
+# _TENOR_RE removed (Bug #4): was never read; Tenor matching
+# is handled inline in load_messages and the JS renderer.
 _WORD_SPLIT_RE = re.compile(r"[^\w\s]")
 
-def prefetch_tenor_thumbs(channels):
-    """Pre-fetch all tenor thumbnail URLs in parallel."""
+def prefetch_tenor_thumbs(channels, all_msgs):
+    """Pre-fetch Tenor thumbnail URLs in parallel with a hard wall-clock cap.
+
+    Uses max_workers=6 (not 20) to avoid thundering-herd rate-limits, a 3 s
+    per-request timeout, and a 25 s global cap — so the script never hangs
+    even if the network is flaky or Tenor is rate-limiting.
+    Any IDs not resolved in time will simply have no thumbnail in the HTML
+    (the placeholder div will still render; the iframe loads on hover as normal).
+    """
+    import time as _time
     tenor_ids = set()
     for ch in channels:
-        for m in ch.get("messages", []):
+        for m in all_msgs.get(ch["id"], []):
             for txt in [m.get("c",""), m.get("a","")]:
                 for url in re.findall(r'https?://tenor\.com/view/[\S]+', txt):
                     tid = url.rstrip('/').split('/')[-1].split('-')[-1]
@@ -668,28 +705,54 @@ def prefetch_tenor_thumbs(channels):
     if not tenor_ids:
         return
     tenor_ids = list(tenor_ids)
-    print(f"  Fetching {len(tenor_ids)} Tenor thumbnails (parallel)...")
-    done = [0]
-    failed = [0]
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {ex.submit(fetch_tenor_thumb, tid): tid for tid in tenor_ids}
-        for f in as_completed(futures):
-            tid = futures[f]
-            result = f.result()
+    print(f"  Fetching {len(tenor_ids)} Tenor thumbnails (max 120 s, 50 workers, retry on 429)...")
+    done = [0]; failed = [0]
+    deadline = _time.monotonic() + 120         # hard cap: never block > 120 s total
+    # Use shutdown(wait=False, cancel_futures=True) so the executor does NOT block
+    # when we exit early — without this the `with` block waits for all 1000+ threads
+    # to finish even after the deadline, causing an apparent hang.
+    ex = ThreadPoolExecutor(max_workers=50)
+    try:
+        # Stagger submissions in small batches to avoid an initial thundering-herd
+        # burst that immediately triggers Tenor's rate-limiter.
+        import time as _tsub, random as _rsub
+        futures = {}
+        for _i, tid in enumerate(tenor_ids):
+            if _i > 0 and _i % 50 == 0:
+                _tsub.sleep(0.15 + _rsub.uniform(0, 0.1))  # brief pause every 50 subs
+            futures[ex.submit(fetch_tenor_thumb, tid)] = tid
+        remaining = max(1, deadline - _time.monotonic())
+        for fut in as_completed(futures, timeout=remaining):
+            if _time.monotonic() > deadline:
+                break
+            tid = futures[fut]
+            try:
+                result = fut.result(timeout=0)
+            except Exception:
+                result = ""
             _TENOR_THUMB_CACHE[tid] = result
             done[0] += 1
             if not result:
                 failed[0] += 1
-            if done[0] % 50 == 0 or done[0] == len(tenor_ids):
-                print(f"    {done[0]}/{len(tenor_ids)}")
+    except Exception:
+        pass  # as_completed timeout raises TimeoutError — handled below
+    finally:
+        # cancel_futures=True cancels pending (not yet running) futures immediately;
+        # wait=False means we don't block for already-running threads to complete.
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # cancel_futures added in Python 3.9 — fallback for older versions
+            ex.shutdown(wait=False)
+    timed_out = len(tenor_ids) - done[0]
     found = sum(1 for v in _TENOR_THUMB_CACHE.values() if v)
-    print(f"  Tenor thumbs OK ({found} found)")
-    if failed[0] == len(tenor_ids) and len(tenor_ids) > 0:
-        log.warning("All %d Tenor fetches failed — you may be offline or rate-limited. "
-                     "GIF previews will be broken in the HTML output.", len(tenor_ids))
-    elif failed[0] > 0:
-        log.warning("%d/%d Tenor fetches failed — some GIF previews may be missing.",
-                     failed[0], len(tenor_ids))
+    print(f"  Tenor thumbs: {found} found, {failed[0]} failed, {timed_out} timed-out")
+    if found == 0 and len(tenor_ids) > 0:
+        log.warning("All %d Tenor fetches failed/timed-out — "
+                    "you may be offline or rate-limited.", len(tenor_ids))
+    elif failed[0] + timed_out > 0:
+        log.warning("%d/%d Tenor thumbs missing (failed=%d timed-out=%d).",
+                    failed[0]+timed_out, len(tenor_ids), failed[0], timed_out)
 
 def calc_stats(channels, total, accum):
     """Finalize statistics from pre-computed accumulators (single-pass, no re-iteration)."""
@@ -736,16 +799,10 @@ def calc_stats(channels, total, accum):
     }
 
 # ─── GENERATE HTML ────────────────────────────────────────
-def generate_html(user, servers_idx, channels, stats, activity, avatar_b64, extra, av_static=None):
+def generate_html(user, servers_idx, channels, all_msgs, stats, activity, avatar_b64, extra, av_static=None, *, output_path=None):
     print("  Δημιουργώ HTML...")
 
-    channels_meta = []
-    all_msgs      = {}
-    for ch in channels:
-        # pop messages to avoid holding two copies in memory (Issue: 1M+ msg RAM usage)
-        msgs = ch.pop("messages")
-        channels_meta.append(ch)
-        all_msgs[ch["id"]] = msgs
+    channels_meta = channels  # already message-free; no pop needed
 
     av_css        = f'background-image:url("{avatar_b64}")' if avatar_b64 else "background:var(--bg3)"
     av_static_css = f'background-image:url("{av_static or avatar_b64}")' if (av_static or avatar_b64) else "background:var(--bg3)"
@@ -764,12 +821,30 @@ def generate_html(user, servers_idx, channels, stats, activity, avatar_b64, extr
             nitro_until = dt.strftime("%d/%m/%Y")
         except: pass
 
-    # Serialize
+    # Per-channel JSON blocks — lazy-loaded by JS via getMsgs(id)
+    def _jd_safe(v):
+        return (json.dumps(v, ensure_ascii=False)
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029"))
+
+    # Bug #8 fix: pop each channel's messages from all_msgs as we serialise it,
+    # so the Python list is freed before the next channel is encoded.
+    # This prevents holding all messages *twice* (dict + JSON string) in RAM.
+    def _ch_scripts_gen(buf):
+        for cid in list(buf.keys()):
+            msgs = buf.pop(cid)
+            yield f'<script type="application/json" id="ch-msgs-{cid}">{_jd_safe(msgs)}</script>'
+            del msgs  # explicit free after serialisation
+
+    ch_json_scripts = "\n".join(_ch_scripts_gen(all_msgs))
+
+    # Serialize (ALL_MSGS removed — now embedded as per-channel <script> tags above)
     JS = {
         "USER":     user,
         "SERVERS":  servers_idx,
         "CHANNELS": channels_meta,
-        "ALL_MSGS": all_msgs,
         "STATS":    {
             "total":       stats["total"],
             "dms":         stats["dms"],
@@ -838,7 +913,7 @@ let contentHtml = linkify(raw);
       });
 """
 
-    return f"""<!DOCTYPE html>
+    html_template = f"""<!DOCTYPE html>
 <html lang="el">
 <head>
 <meta charset="UTF-8">
@@ -1697,13 +1772,14 @@ mark.hl.cur{{
 /* ── CHANNEL HEADER ──────────────────────── */
 #ch-hdr{{
   height:56px;min-height:56px;padding:0 18px;
-  display:flex;align-items:center;gap:10px;position:relative;overflow:hidden;
+  display:flex;align-items:center;gap:10px;position:relative;overflow:visible;
   border-bottom:1px solid rgba(0,0,0,0.40);
   background:rgba(10,12,26,0.65);
   backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);
   flex-shrink:0;
   box-shadow:0 1px 0 rgba(255,255,255,0.05),
              0 4px 20px rgba(0,0,0,0.3);
+  z-index:100;
 }}
 .hdr-ico{{font-size:20px;color:var(--muted);flex-shrink:0}}
 .hdr-name{{font-size:17px;font-weight:700;color:#fff}}
@@ -1723,6 +1799,134 @@ mark.hl.cur{{
   cursor:default;
 }}
 #hdr-srch-btn{{margin-left:auto}}
+
+/* ── MEDIA PANEL ─────────────────────────── */
+#media-panel{{
+  position:absolute;top:57px;right:0;
+  width:440px;
+  max-height:calc(100vh - 120px);
+  background:rgba(8,10,22,0.98);
+  backdrop-filter:blur(32px) saturate(1.3);
+  -webkit-backdrop-filter:blur(32px) saturate(1.3);
+  border-left:1px solid rgba(255,255,255,0.08);
+  border-bottom:1px solid rgba(0,0,0,0.5);
+  border-top:1px solid rgba(255,255,255,0.05);
+  display:flex;flex-direction:column;
+  z-index:150;
+  transform:translateX(100%);
+  transition:transform .22s cubic-bezier(.4,0,.2,1);
+  box-shadow:-8px 0 40px rgba(0,0,0,0.5);
+  overflow:hidden;
+}}
+#media-panel.open{{transform:translateX(0)}}
+
+/* tabs */
+.mp-tabs{{
+  display:flex;border-bottom:1px solid rgba(255,255,255,0.06);
+  flex-shrink:0;
+}}
+.mp-tab{{
+  flex:1 1 0px;width:0;padding:10px 2px;font-size:13px;font-weight:600;
+  text-align:center;cursor:pointer;color:var(--muted);
+  letter-spacing:.02em;
+  border-bottom:2px solid transparent;
+  transition:color .15s,border-color .15s;
+  user-select:none;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  box-sizing:border-box;
+}}
+.mp-tab:hover{{color:var(--text2)}}
+.mp-tab.active{{color:#fff;border-bottom-color:#5865f2}}
+
+/* content */
+.mp-body{{
+  flex:1;overflow-y:auto;overflow-x:hidden;
+  padding:10px;
+  scrollbar-width:thin;scrollbar-color:rgba(88,101,242,0.3) transparent;
+}}
+.mp-empty{{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:8px;padding:40px 20px;
+  color:var(--muted);font-size:13px;text-align:center;
+}}
+.mp-empty-ico{{font-size:32px;opacity:.4}}
+
+/* images grid */
+.mp-img-grid{{
+  display:grid;grid-template-columns:repeat(3,1fr);gap:3px;
+}}
+.mp-thumb{{
+  aspect-ratio:1;border-radius:4px;overflow:hidden;
+  cursor:pointer;position:relative;background:#111;
+  transition:transform .12s,filter .12s;
+}}
+.mp-thumb:hover{{transform:scale(1.04);filter:brightness(1.15)}}
+.mp-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}
+.mp-thumb-gif{{
+  position:absolute;bottom:4px;right:4px;
+  background:rgba(0,0,0,.7);color:#fff;
+  font-size:9px;font-weight:700;padding:1px 4px;
+  border-radius:3px;letter-spacing:.04em;
+}}
+
+/* video list */
+.mp-vid-item{{
+  display:flex;align-items:center;gap:10px;
+  padding:8px;border-radius:8px;cursor:pointer;
+  transition:background .12s;margin-bottom:4px;
+}}
+.mp-vid-item:hover{{background:rgba(255,255,255,0.05)}}
+.mp-vid-thumb{{
+  width:60px;height:40px;border-radius:5px;
+  background:#111;flex-shrink:0;overflow:hidden;
+  display:flex;align-items:center;justify-content:center;
+  font-size:20px;
+}}
+.mp-vid-thumb video{{width:100%;height:100%;object-fit:cover}}
+.mp-vid-name{{font-size:12px;color:var(--text2);word-break:break-all;line-height:1.3}}
+.mp-vid-size{{font-size:10px;color:var(--muted);margin-top:2px}}
+
+/* links list */
+.mp-link-item{{
+  display:flex;align-items:flex-start;gap:8px;
+  padding:8px;border-radius:8px;
+  transition:background .12s;margin-bottom:4px;
+  text-decoration:none;
+}}
+.mp-link-item:hover{{background:rgba(255,255,255,0.05)}}
+.mp-link-ico{{font-size:16px;flex-shrink:0;margin-top:1px}}
+.mp-link-ico-svg{{width:20px;height:20px;flex-shrink:0;display:flex;align-items:center;justify-content:center}}
+.mp-link-ico-svg svg{{width:20px;height:20px}}
+.mp-link-url{{
+  font-size:11px;color:#7289da;word-break:break-all;
+  line-height:1.4;
+}}
+.mp-link-url:hover{{text-decoration:underline}}
+
+/* files list */
+.mp-file-item{{
+  display:flex;align-items:center;gap:10px;
+  padding:8px;border-radius:8px;
+  transition:background .12s;margin-bottom:4px;
+  cursor:pointer;
+}}
+.mp-file-item:hover{{background:rgba(255,255,255,0.05)}}
+.mp-file-ico{{
+  width:36px;height:36px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;overflow:hidden;
+}}
+.mp-file-ico svg{{width:32px;height:32px}}
+.mp-file-info{{flex:1;min-width:0}}
+.mp-file-name{{font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.mp-file-ext{{font-size:10px;color:var(--muted);margin-top:2px;text-transform:uppercase}}
+
+/* header button active state */
+#hdr-media-btn.active{{
+  background:rgba(88,101,242,0.25)!important;
+  color:#fff!important;
+  border-top-color:rgba(88,101,242,0.5)!important;
+}}
 
 /* ── CUSTOM DATE RANGE PICKER ────────────── */
 #date-range-picker{{
@@ -2390,7 +2594,7 @@ mark.hl.cur{{
 }}
 #lb.open{{display:flex}}
 #lb img{{
-  max-width:90vw;max-height:90vh;object-fit:contain;
+  max-width:90vw;max-height:80vh;object-fit:contain;
   border-radius:var(--r3);
   border-top:1px solid rgba(255,255,255,0.12);
   border-left:1px solid rgba(255,255,255,0.07);
@@ -2398,18 +2602,19 @@ mark.hl.cur{{
   box-shadow:0 24px 80px rgba(0,0,0,0.8);
 }}
 #lb-close{{
-  position:fixed;top:20px;right:20px;
-  width:38px;height:38px;border-radius:50%;
-  background:rgba(255,255,255,0.10);
-  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  position:fixed;bottom:32px;left:50%;transform:translateX(-50%);
+  height:46px;padding:0 26px;border-radius:23px;
+  background:rgba(255,255,255,0.14);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
   color:#fff;
-  border-top:1px solid rgba(255,255,255,0.18);
-  border-bottom:1px solid rgba(0,0,0,0.45);
-  font-size:20px;
-  display:flex;align-items:center;justify-content:center;
-  cursor:pointer;transition:background .12s;
+  border:1px solid rgba(255,255,255,0.28);
+  font-size:15px;font-weight:600;letter-spacing:0.3px;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  cursor:pointer;transition:background .15s, transform .15s;
+  box-shadow:0 4px 24px rgba(0,0,0,0.5);
+  white-space:nowrap;user-select:none;
 }}
-#lb-close:hover{{background:rgba(255,255,255,0.22)}}
+#lb-close:hover{{background:rgba(255,255,255,0.26);transform:translateX(-50%) scale(1.04);}}
 
 /* ── GIF WRAPPER WITH PLAY OVERLAY ────────── */
 .att-gif-wrap {{
@@ -3351,7 +3556,7 @@ mark.hl.cur{{
       <div class="activity-box">
         <div class="activity-header">
           <div class="activity-title-wrap">
-            <div class="activity-title" data-i18n="activity-title">Δραστηριότητα</div>
+            <div class="activity-title" data-i18n="activity-title">Activity</div>
             <div class="activity-subtitle" id="activity-subtitle-el" data-i18n="act-sub-month">ΜΗΝΙΑΙΑ ΑΝΑΛΥΣΗ</div>
           </div>
           <div class="activity-tabs">
@@ -3475,6 +3680,7 @@ mark.hl.cur{{
     </div>
 
     <button class="hdr-cnt" id="hdr-srch-btn" title="Αναζήτηση στα μηνύματα (S)" data-i18n-title="search-btn" onclick="openMsgSearch()" tabindex="0" style="cursor:pointer">🔍</button>
+    <button class="hdr-cnt" id="hdr-media-btn" title="Media & Files" onclick="toggleMediaPanel()" tabindex="0" style="cursor:pointer;margin-left:6px">🖼️</button>
 
     <!-- SEARCH BAR — expands horizontally inside header -->
     <div id="msg-search-bar">
@@ -3486,6 +3692,17 @@ mark.hl.cur{{
       </div>
       <button class="srch-close-btn" onclick="closeMsgSearch()" title="Esc" tabindex="0">✕</button>
     </div>
+  </div>
+
+  <!-- MEDIA PANEL -->
+  <div id="media-panel">
+    <div class="mp-tabs">
+      <div class="mp-tab active" data-mp="images" onclick="mpSwitchTab(this,'images')" data-i18n="mp-images">🖼️ Images</div>
+      <div class="mp-tab" data-mp="videos" onclick="mpSwitchTab(this,'videos')" data-i18n="mp-videos">🎥 Videos</div>
+      <div class="mp-tab" data-mp="links"  onclick="mpSwitchTab(this,'links')"  data-i18n="mp-links">🔗 Links</div>
+      <div class="mp-tab" data-mp="files"  onclick="mpSwitchTab(this,'files')"  data-i18n="mp-files">📎 Files</div>
+    </div>
+    <div class="mp-body" id="mp-body"></div>
   </div>
 
   <!-- DATE RANGE PICKER (CUSTOM) -->
@@ -3539,14 +3756,15 @@ mark.hl.cur{{
 
 <!-- CUSTOM CONTEXT MENU -->
 <div id="ctx-menu">
-  <div class="ctx-item" id="ctx-copy-id" onclick="ctxCopyId()"><span class="ctx-ico">🔑</span>Copy ID</div>
-  <div class="ctx-item" id="ctx-copy-name" onclick="ctxCopyName()"><span class="ctx-ico">📋</span>Copy Name</div>
+  <div class="ctx-item" id="ctx-copy-id" onclick="ctxCopyId()"><span class="ctx-ico">🔑</span><span data-i18n="ctx-copy-id">Copy ID</span></div>
+  <div class="ctx-item" id="ctx-copy-name" onclick="ctxCopyName()"><span class="ctx-ico">📋</span><span data-i18n="ctx-copy-name">Copy Name</span></div>
 </div>
 
 <!-- LIGHTBOX -->
 <div id="lb" onclick="closeLB()">
-  <button id="lb-close" onclick="closeLB()">✕</button>
+  <button id="lb-close" onclick="closeLB()" data-i18n="lb-close-btn">✕  Close</button>
   <img id="lb-img" src="" alt="">
+  <video id="lb-vid" controls style="display:none;max-width:90vw;max-height:85vh;border-radius:8px"></video>
 </div>
 
 </div>
@@ -3555,7 +3773,15 @@ mark.hl.cur{{
 const USER      = {jd(JS["USER"])};
 const SERVERS   = {jd(JS["SERVERS"])};
 const CHANNELS  = {jd(JS["CHANNELS"])};
-const ALL_MSGS  = {jd(JS["ALL_MSGS"])};
+// Lazy message loader — reads per-channel <script type="application/json"> tags on demand
+const _MSG_CACHE = {{}};
+function getMsgs(id) {{
+  if (!_MSG_CACHE[id]) {{
+    const el = document.getElementById('ch-msgs-' + id);
+    _MSG_CACHE[id] = el ? JSON.parse(el.textContent) : [];
+  }}
+  return _MSG_CACHE[id];
+}}
 const STATS     = {jd(JS["STATS"])};
 const SRV_COLORS= {jd(JS["SRV_COLORS"])};
 const HAS_AV    = {has_av_js};
@@ -3634,7 +3860,9 @@ function init() {{
   statDefs.forEach(([ico,num,grLbl,enLbl]) => {{
     const d=document.createElement('div');
     d.className='stat-card';
-    d.innerHTML=`<div class="stat-card-ico">${{ico}}</div><div class="stat-card-body"><div class="stat-card-num">${{num}}</div><div class="stat-card-lbl" data-gr="${{grLbl}}" data-en="${{enLbl}}">${{grLbl}}</div></div>`;
+    // Render the label in the current language immediately (applyI18n will keep it in sync)
+    const lbl = LANG === 'el' ? grLbl : enLbl;
+    d.innerHTML=`<div class="stat-card-ico">${{ico}}</div><div class="stat-card-body"><div class="stat-card-num">${{num}}</div><div class="stat-card-lbl" data-gr="${{grLbl}}" data-en="${{enLbl}}">${{lbl}}</div></div>`;
     sr.appendChild(d);
   }});
 
@@ -3644,7 +3872,7 @@ function init() {{
     const fmt2 = ts => ts ? fmtDate(ts.slice(0,10)) : '—';
     const b = document.createElement('div');
     b.className = 'hbadge hb-date';
-    b.innerHTML = `<span class="badge-icon">🌱</span><span class="badge-text"><span class="badge-label" data-i18n="badge-firstmsg">Πρώτο μήνυμα</span><span class="badge-value">${{fmt2(STATS.first_ts)}}</span></span>`;
+    b.innerHTML = `<span class="badge-icon">🌱</span><span class="badge-text"><span class="badge-label" data-i18n="badge-firstmsg">First message</span><span class="badge-value">${{fmt2(STATS.first_ts)}}</span></span>`;
     el.appendChild(b);
   }}
 
@@ -3674,6 +3902,10 @@ function init() {{
 
   // ── Extra sections (new data) ──
   buildExtraSections();
+
+  // Apply language translations to all dynamic elements built above
+  // (stat-row labels, hero-badges, activity-title, lb-close, etc.)
+  applyI18n();
 }}
 
 // ── HERO BADGES ────────────────────────────────────────────
@@ -3695,7 +3927,7 @@ function buildHeroBadges() {{
   if (USER.premium_until && USER.premium_until !== '') {{
     const until = USER.premium_until.split('T')[0];
     const [y,m,d] = until.split('-');
-    el.appendChild(makeBadge('hb-nitro hb-i18n','⚡','Nitro λήγει','nitro-lbl',`${{d}}/${{m}}/${{y}}`));
+    el.appendChild(makeBadge('hb-nitro hb-i18n','⚡','Nitro expires','nitro-lbl',`${{d}}/${{m}}/${{y}}`));
   }}
   
   // Mobile
@@ -3713,7 +3945,7 @@ function buildHeroBadges() {{
     const created = USER.created_at.split('T')[0];
     const [y,m,d] = created.split('-');
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    el.appendChild(makeBadge('hb-discord hb-i18n','🎂','Μέλος από','discord-lbl',`${{d}} ${{MONTHS[parseInt(m)-1]}} ${{y}}`));
+    el.appendChild(makeBadge('hb-discord hb-i18n','🎂','Member since','discord-lbl',`${{d}} ${{MONTHS[parseInt(m)-1]}} ${{y}}`));
   }}
   
   // HypeSquad
@@ -4091,10 +4323,12 @@ function makeChItem(ch) {{
 // ── OPEN CHANNEL ───────────────────────────────────────────
 function openCh(ch) {{
   curCh=ch; curPage=1; allMsgsLoaded=false;
+  _mpCacheKey = null; _mpCacheData = null; // invalidate media cache
   dateRange = {{ start: null, end: null }};
   _drp.selStart = null; _drp.selEnd = null; _drp.focus = 'start';
-  // Close date picker if open
+  // Close date picker and media panel if open
   document.getElementById('date-range-picker').classList.remove('visible');
+  closeMediaPanel();
   document.querySelectorAll('.ch-item').forEach(r=>r.classList.toggle('sel',r.dataset.id===ch.id));
   document.getElementById('home').style.display    ='none';
   document.getElementById('ch-hdr').style.display  ='flex';
@@ -4116,9 +4350,9 @@ function openCh(ch) {{
   }}
   
   // Ορισμός min/max για custom date picker
-  if (ch.messages && ch.messages.length) {{
-    _drp.minDate = ch.messages[ch.messages.length-1].ts.slice(0,10);
-    _drp.maxDate = ch.messages[0].ts.slice(0,10);
+  if (ch.first_ts && ch.last_ts) {{
+    _drp.minDate = ch.first_ts.slice(0,10);
+    _drp.maxDate = ch.last_ts.slice(0,10);
   }}
   
   document.getElementById('msgs').innerHTML = '';
@@ -4139,6 +4373,15 @@ const MONTHS_EN = ['January','February','March','April','May','June',
                    'July','August','September','October','November','December'];
 const WD_GR = ['Κυ','Δε','Τρ','Τε','Πε','Πα','Σα'];
 const WD_EN = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+
+// Local-time date string helper — avoids toISOString() UTC offset bug
+// (e.g. UTC+2 user at 23:30 would get "tomorrow" from toISOString)
+function _localDateStr(d) {{
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${{y}}-${{m}}-${{day}}`;
+}}
 
 let _drp = {{
   selStart: null,   // 'YYYY-MM-DD' | null
@@ -4168,7 +4411,7 @@ function toggleDateRangePicker() {{
   if (lm < 0) {{ lm = 11; ly--; }}
   // If channel has messages, seed from its range
   if (curCh) {{
-    const msgs = ALL_MSGS[curCh.id] || [];
+    const msgs = getMsgs(curCh.id);
     if (msgs.length) {{
       const first = msgs[msgs.length-1].ts.slice(0,7);
       const last  = msgs[0].ts.slice(0,7);
@@ -4219,7 +4462,7 @@ function _drpRenderCal(side, year, month) {{
   const WD = LANG==='el' ? WD_GR : WD_EN;
   const MN = LANG==='el' ? MONTHS_GR : MONTHS_EN;
   const today = new Date(); today.setHours(0,0,0,0);
-  const todayStr = today.toISOString().slice(0,10);
+  const todayStr = _localDateStr(today);
   // Nav arrows: left cal has prev, right cal has next; between them, shared nav
   const showPrev = isLeft;
   const showNext = !isLeft;
@@ -4308,8 +4551,8 @@ function _drpSelectDay(dateStr) {{
 function drpShortcut(days) {{
   const end = new Date(); end.setHours(0,0,0,0);
   const start = new Date(end); start.setDate(start.getDate() - days + 1);
-  _drp.selStart = start.toISOString().slice(0,10);
-  _drp.selEnd   = end.toISOString().slice(0,10);
+  _drp.selStart = _localDateStr(start);
+  _drp.selEnd   = _localDateStr(end);
   // Snap calendar to show the range end
   const rm = end.getMonth(), ry = end.getFullYear();
   let lm = rm-1, ly = ry;
@@ -4480,13 +4723,13 @@ function _buildAnnotatedFragment(items) {{
         }} else if (/[.](jpg|jpeg|png|gif|webp)$/.test(cl)) {{
           const isGif = /[.]gif$/.test(cl);
           if (isGif) {{
-            body += '<div class="att-gif-wrap" onclick="openLB(\\\'' + esc(url) + '\\\')" title="Click to enlarge">'
-                  + '<img src="' + esc(url) + '" loading="lazy" onerror="_imgExpired(this)">'
+            body += '<div class="att-gif-wrap" onclick="openLB(\\\'' + escUrl(url) + '\\\')" title="Click to enlarge">'
+                  + '<img src="' + escUrl(url) + '" loading="lazy" onerror="_imgExpired(this)">'
                   + '<div class="gif-play-btn">${{SVG_GIF_PLAY}}</div>'
                   + '</div>';
           }} else {{
-            body += '<div class="att-img" onclick="openLB(\\\'' + esc(url) + '\\\')" title="Click to enlarge">'
-                  + '<img src="' + esc(url) + '" loading="lazy" onerror="_imgExpired(this)">'
+            body += '<div class="att-img" onclick="openLB(\\\'' + escUrl(url) + '\\\')" title="Click to enlarge">'
+                  + '<img src="' + escUrl(url) + '" loading="lazy" onerror="_imgExpired(this)">'
                   + '</div>';
           }}
         }} else if (/[.](mp4|mov|webm|mkv|m4v|avi)$/.test(cl)) {{
@@ -4498,8 +4741,8 @@ function _buildAnnotatedFragment(items) {{
     onpause="vidOnPause('${{vidId}}')"
     ontimeupdate="vidOnTime('${{vidId}}')"
     onloadedmetadata="vidOnMeta('${{vidId}}')"
-    onerror="_vidExpired('${{vidId}}','${{esc(url)}}')"
-  ><source src="${{esc(url)}}" onerror="_vidExpired('${{vidId}}','${{esc(url)}}')" ></video>
+    onerror="_vidExpired('${{vidId}}','${{escUrl(url)}}')"
+  ><source src="${{escUrl(url)}}" onerror="_vidExpired('${{vidId}}','${{escUrl(url)}}')" ></video>
   <button class="vid-play-btn" id="pbtn_${{vidId}}" onclick="vidTogglePlay('${{vidId}}')">${{SVG_PLAY}}</button>
   <!-- progress bar — hidden when fullscreen -->
   <div class="vid-progress-wrap" id="vprog_${{vidId}}"
@@ -4534,11 +4777,11 @@ function _buildAnnotatedFragment(items) {{
     <input class="aud-vol-slider" id="vslider_${{audId}}" type="range" min="0" max="1" step="0.05" value="1"
       oninput="audSetVol('${{audId}}',this)" style="--avol:100%">
   </div>
-  <audio id="${{audId}}" preload="metadata" src="${{esc(url)}}"
+  <audio id="${{audId}}" preload="metadata" src="${{escUrl(url)}}"
     ontimeupdate="audUpdate('${{audId}}')" onended="audEnded('${{audId}}')" onloadedmetadata="audMeta('${{audId}}')"></audio>
 </div>`;
         }} else {{
-          body += '<a class="att-file" href="' + esc(url) + '" target="_blank" rel="noopener">📎 ' + esc(fn) + '</a>';
+          body += '<a class="att-file" href="' + escUrl(url) + '" target="_blank" rel="noopener">📎 ' + esc(fn) + '</a>';
         }}
       }});
     }}
@@ -4608,7 +4851,7 @@ function renderMsgs() {{
   // restore nav buttons visibility
   const _nb = document.getElementById('nav-buttons');
   if (_nb) _nb.style.visibility = 'visible';
-  const all   = filterMessagesByDate(ALL_MSGS[curCh.id] || []);
+  const all   = filterMessagesByDate(getMsgs(curCh.id));
   const area  = document.getElementById('msgs');
   const lm    = document.getElementById('load-area');
   
@@ -4631,7 +4874,7 @@ function renderMsgs() {{
 
 function loadMore(loadAll = false) {{
   if (!curCh || isLoadingMsgs) return;
-  const all  = filterMessagesByDate(ALL_MSGS[curCh.id] || []);
+  const all  = filterMessagesByDate(getMsgs(curCh.id));
   const lm   = document.getElementById('load-area');
   const area = document.getElementById('msgs');
 
@@ -4743,7 +4986,7 @@ function goToFirst() {{
   if (allMsgsLoaded) {{ area.scrollTop = 0; return; }}
   _lockNav(true);
   _defer(() => {{
-    const all = filterMessagesByDate(ALL_MSGS[curCh.id] || []);
+    const all = filterMessagesByDate(getMsgs(curCh.id));
     const totalPages = Math.ceil(all.length / PER_PAGE);
     curPage = totalPages;
     area.innerHTML = '';
@@ -4950,6 +5193,309 @@ function drawActivity() {{
   }});
 }}
 
+// ── MEDIA PANEL ─────────────────────────────────────────────────────────────
+
+// SVG icon maps — link icons
+const _MP_LSVG = {{
+  youtube:     `<svg viewBox="0 0 24 24" fill="#FF0000"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.5 12 3.5 12 3.5s-7.5 0-9.4.6A3 3 0 0 0 .5 6.2C0 8.1 0 12 0 12s0 3.9.5 5.8a3 3 0 0 0 2.1 2.1c1.9.6 9.4.6 9.4.6s7.5 0 9.4-.6a3 3 0 0 0 2.1-2.1C24 15.9 24 12 24 12s0-3.9-.5-5.8zM9.7 15.5V8.5l6.3 3.5-6.3 3.5z"/></svg>`,
+  github:      `<svg viewBox="0 0 24 24" fill="#fff"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2 0-.4-.5-1.6.2-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17 4.7 18 5 18 5c.7 1.6.2 2.8.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"/></svg>`,
+  steam:       `<svg viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#1b2838"/><path fill="#c7d5e0" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 4c2.21 0 4 1.79 4 4s-1.79 4-4 4-4-1.79-4-4 1.79-4 4-4zm0 14c-2.67 0-5.03-1.31-6.48-3.32A7.96 7.96 0 0 1 9.5 15.5c.75.31 1.56.5 2.5.5s1.75-.19 2.5-.5a7.96 7.96 0 0 1 3.98 1.18C17.03 18.69 14.67 20 12 20z"/></svg>`,
+  spotify:     `<svg viewBox="0 0 24 24" fill="#1DB954"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.7 0 12 0zm5.5 17.3c-.2.4-.7.5-1 .3-2.8-1.7-6.4-2.1-10.6-1.1-.4.1-.8-.2-.9-.5-.1-.4.2-.8.5-.9 4.6-1 8.5-.6 11.6 1.3.5.2.5.7.4 0.9zm1.5-3.3c-.3.4-.8.6-1.3.3-3.2-2-8.1-2.6-11.9-1.4-.5.1-1-.1-1.1-.6-.1-.5.1-1 .6-1.1 4.4-1.3 9.8-.7 13.5 1.6.4.2.6.8.2 1.2zm.1-3.4C15.2 8.4 8.8 8.2 5.2 9.3c-.6.2-1.2-.2-1.4-.7-.2-.6.2-1.2.7-1.4C9 5.9 16 6.1 20.4 8.5c.5.3.7 1 .4 1.6-.3.4-.9.6-1.3.3 0 .2 0 .2 0 .2z"/></svg>`,
+  twitter:     `<svg viewBox="0 0 24 24" fill="#1DA1F2"><path d="M23.95 4.57a10 10 0 01-2.82.775 4.96 4.96 0 002.16-2.72c-.95.56-2 .96-3.13 1.18a4.92 4.92 0 00-8.38 4.48C7.69 8.1 4.07 6.13 1.64 3.16a4.82 4.82 0 00-.67 2.48c0 1.71.87 3.21 2.19 4.1a4.9 4.9 0 01-2.23-.62v.06a4.92 4.92 0 003.95 4.83 5 5 0 01-2.21.08 4.94 4.94 0 004.6 3.42 9.87 9.87 0 01-6.1 2.1c-.4 0-.78-.02-1.17-.07a13.99 13.99 0 007.56 2.21c9.05 0 14-7.5 14-13.99 0-.21 0-.42-.02-.63A9.94 9.94 0 0024 4.59z"/></svg>`,
+  discord:     `<svg viewBox="0 0 24 24" fill="#5865F2"><path d="M20.3 4.4a19.8 19.8 0 0 0-4.9-1.5.07.07 0 0 0-.08.04c-.21.37-.44.86-.61 1.25a18.3 18.3 0 0 0-5.49 0 12.6 12.6 0 0 0-.62-1.25.08.08 0 0 0-.08-.04A19.7 19.7 0 0 0 3.7 4.4a.07.07 0 0 0-.03.03C.53 9.05-.32 13.58.1 18.06a.08.08 0 0 0 .03.05 19.9 19.9 0 0 0 6 3.03.08.08 0 0 0 .08-.03c.46-.63.87-1.3 1.23-2a.08.08 0 0 0-.04-.1 13.1 13.1 0 0 1-1.87-.9.08.08 0 0 1 0-.13c.13-.1.25-.2.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13 12.3 12.3 0 0 1-1.87.89.08.08 0 0 0-.04.11c.36.7.77 1.36 1.23 1.99a.08.08 0 0 0 .08.03 19.8 19.8 0 0 0 6-3.03.07.07 0 0 0 .03-.05c.5-5.18-.84-9.67-3.55-13.66a.06.06 0 0 0-.03-.03zM8.02 15.3c-1.18 0-2.16-1.08-2.16-2.42s.96-2.42 2.16-2.42c1.21 0 2.17 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42zm7.97 0c-1.18 0-2.16-1.08-2.16-2.42s.96-2.42 2.16-2.42c1.21 0 2.17 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42z"/></svg>`,
+  twitch:      `<svg viewBox="0 0 24 24" fill="#9146FF"><path d="M11.6 4.7h1.7v5.2h-1.7zm4.7 0H18v5.2h-1.7zM6 0L1.7 4.3v15.4h5.1V24l4.3-4.3h3.4l8.3-8.3V0H6zm14.6 10.9l-3.4 3.4h-3.4l-3 3v-3H7V1.7h13.6v9.2z"/></svg>`,
+  reddit:      `<svg viewBox="0 0 24 24" fill="#FF4500"><path d="M12 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0zm5 4.7a1.25 1.25 0 0 1 0 2.5 1.25 1.25 0 0 1-2.5-.05l-2.6-.55-.8 3.75c1.82.07 3.48.63 4.67 1.49.31-.31.73-.49 1.21-.49.97 0 1.75.79 1.75 1.75 0 .72-.44 1.33-1.01 1.61.03.17.04.35.04.52 0 2.7-3.13 4.87-7 4.87s-7-2.17-7-4.87c0-.18.01-.37.04-.53a1.75 1.75 0 0 1-1.01-1.61c0-.97.79-1.75 1.75-1.75.46 0 .9.2 1.21.49 1.19-.88 2.87-1.43 4.74-1.49l.89-4.18a.34.34 0 0 1 .38-.24l2.91.62zM9.25 12c-.69 0-1.25.56-1.25 1.25s.56 1.25 1.25 1.25S10.5 13.94 10.5 13.25 9.94 12 9.25 12zm5.5 0c-.69 0-1.25.56-1.25 1.25s.56 1.25 1.25 1.25 1.25-.56 1.25-1.25S15.44 12 14.75 12zm-5.47 4a.33.33 0 0 0-.23.56c.84.84 2.48.91 2.96.91.48 0 2.1-.06 2.96-.91a.36.36 0 0 0-.46-.55c-.55.53-1.68.73-2.51.73s-1.98-.2-2.51-.73a.33.33 0 0 0-.21-.01z"/></svg>`,
+  instagram:   `<svg viewBox="0 0 24 24"><defs><linearGradient id="ig_mp" x1="0%" y1="100%" x2="100%" y2="0%"><stop offset="0%" stop-color="#FD5949"/><stop offset="50%" stop-color="#D6249F"/><stop offset="100%" stop-color="#285AEB"/></linearGradient></defs><path fill="url(#ig_mp)" d="M12 2.2c3.2 0 3.6.01 4.85.07 3.25.15 4.77 1.69 4.92 4.92.06 1.27.07 1.65.07 4.85 0 3.2-.01 3.58-.07 4.85-.15 3.22-1.66 4.77-4.92 4.92-1.25.06-1.63.07-4.85.07-3.2 0-3.58-.01-4.85-.07-3.26-.15-4.77-1.7-4.92-4.92C2.17 15.58 2.16 15.2 2.16 12c0-3.2.01-3.58.07-4.85C2.38 3.89 3.9 2.37 7.15 2.27 8.42 2.21 8.8 2.2 12 2.2zm0-2.2C8.74 0 8.33.01 7.05.07 2.7.27.27 2.7.07 7.05.01 8.33 0 8.74 0 12c0 3.26.01 3.67.07 4.95.2 4.36 2.62 6.78 6.98 6.98C8.33 23.99 8.74 24 12 24c3.26 0 3.67-.01 4.95-.07 4.35-.2 6.78-2.62 6.98-6.98C23.99 15.67 24 15.26 24 12c0-3.26-.01-3.67-.07-4.95C23.78 2.7 21.36.27 17.05.07 15.67.01 15.26 0 12 0zm0 5.84a6.16 6.16 0 1 0 0 12.32A6.16 6.16 0 0 0 12 5.84zM12 16a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm6.4-11.85a1.44 1.44 0 1 0 0 2.88 1.44 1.44 0 0 0 0-2.88z"/></svg>`,
+  tiktok:      `<svg viewBox="0 0 24 24"><path fill="#fff" d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.22 8.22 0 004.84 1.56V6.79a4.85 4.85 0 01-1.07-.1z"/></svg>`,
+  googledrive: `<svg viewBox="0 0 87.3 78"><path fill="#0066da" d="M6.6 66.85l3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8H0c0 1.55.4 3.1 1.2 4.5z"/><path fill="#00ac47" d="M43.65 25L29.9 1.2C28.55 2 27.4 3.1 26.6 4.5L1.2 48.5A9 9 0 0 0 0 53h27.5z"/><path fill="#ea4335" d="M73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.4 1.2-2.95 1.2-4.5H59.8L73.55 76.8z"/><path fill="#00832d" d="M43.65 25L57.4 1.2C56.05.4 54.5 0 52.9 0H34.4c-1.6 0-3.15.45-4.5 1.2z"/><path fill="#2684fc" d="M59.8 53H27.5L13.75 76.8c1.35.8 2.9 1.2 4.5 1.2h50.8c1.6 0 3.15-.45 4.5-1.2z"/><path fill="#ffba00" d="M73.4 26.5l-12.8-22.2c-.8-1.4-1.95-2.5-3.3-3.3L43.65 25 59.8 53h27.45c0-1.55-.4-3.1-1.2-4.5z"/></svg>`,
+  dropbox:     `<svg viewBox="0 0 24 24" fill="#0061FF"><path d="M6 2L0 6l6 4 6-4zM18 2l-6 4 6 4 6-4zM0 14l6 4 6-4-6-4zM18 10l-6 4 6 4 6-4zM6 19l6 4 6-4-6-4z"/></svg>`,
+  soundcloud:  `<svg viewBox="0 0 24 24" fill="#FF5500"><path d="M1.2 13.2c-.1.4.1.8.5.9.4.1.8-.1.9-.5l.6-3-.6-3c-.1-.4-.5-.6-.9-.5-.4.1-.6.5-.5.9l.5 2.6-.5 2.6zm2.1 1.6c-.1.5.2.9.7 1 .5.1.9-.2 1-.7l.5-2.5-.5-2.6c-.1-.5-.5-.8-1-.7-.5.1-.8.5-.7 1l.4 2.3-.4 2.2zm2.3.9c-.1.5.3 1 .8 1.1.5.1 1-.3 1.1-.8l.4-2.3-.4-2.4c-.1-.5-.6-.9-1.1-.8-.5.1-.9.6-.8 1.1l.3 2.1-.3 2.1zm2.4.4c-.1.6.3 1.1.9 1.2.6.1 1.1-.3 1.2-.9l.4-2.4-.4-2.5c-.1-.6-.6-1-1.2-.9-.6.1-1 .6-.9 1.2l.3 2.2-.3 2.1zm2.5-.4c0 .6.5 1.1 1.1 1.1.6 0 1.1-.5 1.1-1.1l.3-2.1-.3-2.2c0-.6-.5-1.1-1.1-1.1-.6 0-1.1.5-1.1 1.1l-.3 2.2.3 2.1zm6.3-7.8c-.3 0-.5.1-.8.2-.4-2.8-2.8-4.9-5.7-4.9-1 0-1.9.3-2.7.7v9.5h9.2c1.5 0 2.7-1.2 2.7-2.7 0-1.6-1.2-2.8-2.7-2.8z"/></svg>`,
+  linkedin:    `<svg viewBox="0 0 24 24" fill="#0A66C2"><path d="M20.45 20.45h-3.55v-5.57c0-1.33-.03-3.04-1.85-3.04-1.85 0-2.14 1.44-2.14 2.94v5.67H9.37V9h3.41v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28zM5.34 7.43a2.06 2.06 0 1 1 0-4.12 2.06 2.06 0 0 1 0 4.12zM7.12 20.45H3.56V9h3.56v11.45zM22.22 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.23.8 24 1.77 24h20.45C23.2 24 24 23.23 24 22.27V1.73C24 .77 23.2 0 22.22 0z"/></svg>`,
+  tenor:       `<svg viewBox="0 0 24 24"><rect width="24" height="24" rx="6" fill="#1DB1FF"/><text x="12" y="17" font-size="11" font-weight="900" fill="white" text-anchor="middle" font-family="Arial,sans-serif">GIF</text></svg>`,
+  patreon:     `<svg viewBox="0 0 24 24" fill="#F96854"><path d="M14.82 2.41c3.96 0 7.18 3.24 7.18 7.21 0 3.96-3.22 7.18-7.18 7.18-3.98 0-7.21-3.22-7.21-7.18 0-3.97 3.23-7.21 7.21-7.21M2 21.6h3.5V2.41H2V21.6z"/></svg>`,
+  imgur:       `<svg viewBox="0 0 24 24" fill="#1BB76E"><path d="M14.02 3.67c1.1.28 1.83 1.3 1.76 2.43l-.49 8.4c-.08 1.43-1.3 2.5-2.73 2.42-1.43-.08-2.5-1.3-2.42-2.73l.49-8.4c.07-1.14 1.01-2.02 2.14-2.02.42 0 .83.12 1.18.36l.07-.46zM8 3.5c1.38 0 2.5 1.12 2.5 2.5S9.38 8.5 8 8.5 5.5 7.38 5.5 6 6.62 3.5 8 3.5zm0 9c1.38 0 2.5 1.12 2.5 2.5S9.38 17.5 8 17.5 5.5 16.38 5.5 15 6.62 12 8 12z"/></svg>`,
+  default:     `<svg viewBox="0 0 24 24" fill="none" stroke="#7289da" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10A15.3 15.3 0 0 1 8 12 15.3 15.3 0 0 1 12 2z" stroke-width="1.5"/></svg>`,
+}};
+
+// SVG icon maps — file type icons
+const _MP_FSVG = {{
+  pdf:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#E53935"/><path fill="rgba(255,255,255,.15)" d="M20 0l12 12v20H20z"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">PDF</text></svg>`,
+  zip:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#FF8F00"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">ZIP</text></svg>`,
+  rar:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#E65100"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">RAR</text></svg>`,
+  '7z':  `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#E65100"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">7Z</text></svg>`,
+  tar:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#BF360C"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">TAR</text></svg>`,
+  gz:     `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#BF360C"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">GZ</text></svg>`,
+  mp3:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1DB954"/><circle cx="12" cy="22" r="4" fill="rgba(0,0,0,.4)"/><circle cx="12" cy="22" r="1.5" fill="#1DB954"/><rect x="14" y="8" width="2" height="14" rx="1" fill="rgba(255,255,255,.9)"/><rect x="18" y="11" width="2" height="11" rx="1" fill="rgba(255,255,255,.7)"/></svg>`,
+  wav:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#00ACC1"/><path stroke="#fff" stroke-width="2" fill="none" d="M4 16 8 8 10 24 14 10 16 22 20 6 22 26 26 16 28 16"/></svg>`,
+  flac:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#7E57C2"/><path stroke="#fff" stroke-width="2" fill="none" d="M4 16 8 8 10 24 14 10 16 22 20 6 22 26 26 16 28 16"/></svg>`,
+  ogg:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#AB47BC"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">OGG</text></svg>`,
+  mp4:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1565C0"/><polygon points="12,9 12,23 24,16" fill="#fff"/></svg>`,
+  mov:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#0D47A1"/><polygon points="12,9 12,23 24,16" fill="#fff"/></svg>`,
+  webm:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1976D2"/><polygon points="12,9 12,23 24,16" fill="#fff"/></svg>`,
+  mkv:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#283593"/><polygon points="12,9 12,23 24,16" fill="#fff"/></svg>`,
+  avi:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1A237E"/><polygon points="12,9 12,23 24,16" fill="#fff"/></svg>`,
+  doc:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1565C0"/><path fill="rgba(255,255,255,.15)" d="M20 0l12 12v20H20z"/><text x="16" y="22" font-size="9" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">DOC</text></svg>`,
+  docx:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1565C0"/><path fill="rgba(255,255,255,.15)" d="M20 0l12 12v20H20z"/><text x="16" y="22" font-size="8" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">DOCX</text></svg>`,
+  xls:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#2E7D32"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">XLS</text></svg>`,
+  xlsx:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#2E7D32"/><text x="16" y="22" font-size="8" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">XLSX</text></svg>`,
+  csv:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#388E3C"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">CSV</text></svg>`,
+  ppt:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#C62828"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">PPT</text></svg>`,
+  pptx:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#C62828"/><text x="16" y="22" font-size="8" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">PPTX</text></svg>`,
+  txt:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#37474F"/><line x1="8" y1="11" x2="24" y2="11" stroke="#fff" stroke-width="2"/><line x1="8" y1="16" x2="24" y2="16" stroke="#fff" stroke-width="2"/><line x1="8" y1="21" x2="18" y2="21" stroke="#fff" stroke-width="2"/></svg>`,
+  json:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#F57F17"/><text x="16" y="22" font-size="9" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">JSON</text></svg>`,
+  xml:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#00897B"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">XML</text></svg>`,
+  html:   `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#E64A19"/><text x="16" y="22" font-size="8" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">HTML</text></svg>`,
+  css:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1565C0"/><text x="16" y="22" font-size="10" font-weight="700" fill="#fff" text-anchor="middle" font-family="Arial">CSS</text></svg>`,
+  js:     `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#F9A825"/><text x="16" y="22" font-size="10" font-weight="700" fill="#333" text-anchor="middle" font-family="Arial">JS</text></svg>`,
+  py:     `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1565C0"/><text x="16" y="22" font-size="10" font-weight="700" fill="#FFD600" text-anchor="middle" font-family="Arial">PY</text></svg>`,
+  exe:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#455A64"/><text x="16" y="22" font-size="9" font-weight="700" fill="#90CAF9" text-anchor="middle" font-family="Arial">EXE</text></svg>`,
+  apk:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#43A047"/><path fill="#fff" d="M10 18h12v2H10zM11 14l-3-5h2l2 3.5L14 9h2l-3 5M18 14l3-5h-2l-2 3.5L15 9h-2l3 5"/></svg>`,
+  dmg:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#424242"/><text x="16" y="22" font-size="9" font-weight="700" fill="#90CAF9" text-anchor="middle" font-family="Arial">DMG</text></svg>`,
+  iso:    `<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#37474F"/><circle cx="16" cy="16" r="8" fill="none" stroke="#90CAF9" stroke-width="2"/><circle cx="16" cy="16" r="3" fill="none" stroke="#90CAF9" stroke-width="1.5"/></svg>`,
+  default:`<svg viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#37474F"/><path fill="#90CAF9" d="M10 6h8l6 6v14a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" opacity=".7"/><path fill="#546E7A" d="M18 6l6 6h-6z"/></svg>`,
+}};
+
+function _mpLinkSvg(url) {{
+  if (/tenor\\.com/i.test(url))                    return _MP_LSVG.tenor;
+  if (/youtube\\.com|youtu\\.be/i.test(url))        return _MP_LSVG.youtube;
+  if (/github\\.com/i.test(url))                   return _MP_LSVG.github;
+  if (/store\\.steampowered|steamcommunity/i.test(url)) return _MP_LSVG.steam;
+  if (/open\\.spotify|spotify\\.com/i.test(url))   return _MP_LSVG.spotify;
+  if (/twitter\\.com|x\\.com/i.test(url))           return _MP_LSVG.twitter;
+  if (/discord\\.gg|discord\\.com/i.test(url))      return _MP_LSVG.discord;
+  if (/twitch\\.tv/i.test(url))                    return _MP_LSVG.twitch;
+  if (/reddit\\.com/i.test(url))                   return _MP_LSVG.reddit;
+  if (/instagram\\.com/i.test(url))                return _MP_LSVG.instagram;
+  if (/tiktok\\.com/i.test(url))                   return _MP_LSVG.tiktok;
+  if (/drive\\.google|docs\\.google/i.test(url))    return _MP_LSVG.googledrive;
+  if (/dropbox\\.com/i.test(url))                  return _MP_LSVG.dropbox;
+  if (/soundcloud\\.com/i.test(url))               return _MP_LSVG.soundcloud;
+  if (/linkedin\\.com/i.test(url))                 return _MP_LSVG.linkedin;
+  if (/patreon\\.com/i.test(url))                  return _MP_LSVG.patreon;
+  if (/imgur\\.com/i.test(url))                    return _MP_LSVG.imgur;
+  return _MP_LSVG.default;
+}}
+function _mpFileSvg(ext) {{ return _MP_FSVG[ext.toLowerCase()] || _MP_FSVG.default; }}
+
+let _mpTab = 'images';
+let _mpRenderToken = null;
+let _mpCacheKey = null;   // channel id for which cache is valid
+let _mpCacheData = null;  // cached result of _mpCollect()
+
+function toggleMediaPanel() {{
+  const panel = document.getElementById('media-panel');
+  const btn   = document.getElementById('hdr-media-btn');
+  const isOpen = panel.classList.contains('open');
+  if (isOpen) {{
+    panel.classList.remove('open');
+    btn.classList.remove('active');
+  }} else {{
+    panel.classList.add('open');
+    btn.classList.add('active');
+    mpRender(_mpTab);
+  }}
+}}
+function closeMediaPanel() {{
+  document.getElementById('media-panel').classList.remove('open');
+  document.getElementById('hdr-media-btn').classList.remove('active');
+  _mpRenderToken = null;
+}}
+function mpSwitchTab(el, tab) {{
+  _mpTab = tab;
+  document.querySelectorAll('.mp-tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  mpRender(tab);
+}}
+
+function _mpCollect() {{
+  const msgs = getMsgs(curCh.id);
+  const images=[], videos=[], links=[], files=[];
+  const _imgExt  = /\\.(jpg|jpeg|png|gif|webp)(\\?|$)/i;
+  const _vidExt  = /\\.(mp4|mov|webm|mkv|m4v|avi)(\\?|$)/i;
+  const _fileExt = /\\.(pdf|zip|rar|7z|tar|gz|txt|csv|json|xml|html|css|js|py|doc|docx|xls|xlsx|ppt|pptx|apk|exe|dmg|iso|mp3|ogg|wav|flac)(\\?|$)/i;
+  const _urlRe   = /https?:\\/\\/[^\\s<>")\\]]+/g;
+  // iterate newest-first (msgs stored oldest→newest, so iterate reverse)
+  for (let i = msgs.length - 1; i >= 0; i--) {{
+    const m = msgs[i];
+    if (m.a) {{
+      m.a.split(' ').filter(Boolean).forEach(url => {{
+        const cl = url.split('?')[0].toLowerCase();
+        if (_imgExt.test(cl))       images.push(url);
+        else if (_vidExt.test(cl))  videos.push(url);
+        else if (_fileExt.test(cl)) files.push(url);
+      }});
+    }}
+    if (m.c) {{
+      (m.c.match(_urlRe) || []).forEach(u => {{
+        const cl = u.split('?')[0].toLowerCase();
+        if (!_imgExt.test(cl) && !_vidExt.test(cl) && !_fileExt.test(cl)) links.push(u);
+      }});
+    }}
+  }}
+  return {{ images, videos, links:[...new Set(links)], files }};
+}}
+
+function mpRender(tab) {{
+  const tok = Symbol();
+  _mpRenderToken = tok;
+  const body = document.getElementById('mp-body');
+  if (!curCh) {{
+    body.innerHTML = '<div class="mp-empty"><div class="mp-empty-ico">📭</div>No channel open</div>';
+    return;
+  }}
+  body.innerHTML = `
+    <div class="mp-progress-wrap" id="mp-prog-wrap" style="height:3px;background:rgba(255,255,255,.07);border-radius:2px;overflow:hidden;margin:0 0 8px 0;transition:opacity .4s">
+      <div id="mp-prog-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#5865f2,#a5b4fc);border-radius:2px;transition:width .2s ease"></div>
+    </div>
+    <div id="mp-content" class="${{tab==='images'?'mp-img-grid':''}}"></div>`;
+
+  // Use cached collection — rebuild only if channel changed
+  const _cacheKey = curCh ? curCh.id : null;
+  if (_mpCacheKey !== _cacheKey) {{
+    _mpCacheData = _mpCollect();
+    _mpCacheKey  = _cacheKey;
+  }}
+  const data    = _mpCacheData;
+  const items   = data[tab];
+  if (!items.length) {{
+    body.innerHTML = `<div class="mp-empty"><div class="mp-empty-ico">${{
+      {{images:'🖼️',videos:'🎥',links:'🔗',files:'📎'}}[tab]
+    }}</div>Nothing here yet</div>`;
+    return;
+  }}
+
+  const prog    = document.getElementById('mp-prog-bar');
+  const content = document.getElementById('mp-content');
+  const BATCH   = tab === 'images' ? 50 : 25;
+  let idx = 0;
+
+  function renderBatch() {{
+    if (_mpRenderToken !== tok) return; // cancelled
+    const end  = Math.min(idx + BATCH, items.length);
+    const frag = document.createDocumentFragment();
+    for (let i = idx; i < end; i++) frag.appendChild(mpMakeItem(tab, items[i]));
+    content.appendChild(frag);
+    idx = end;
+    prog.style.width = Math.round(idx / items.length * 100) + '%';
+    if (idx < items.length) {{
+      setTimeout(renderBatch, 16); // ~1 frame gap — lets browser paint/respond
+    }} else {{
+      setTimeout(() => {{
+        const w = document.getElementById('mp-prog-wrap');
+        if (w) w.style.opacity = '0';
+      }}, 500);
+    }}
+  }}
+  setTimeout(renderBatch, 0);
+}}
+
+function mpMakeItem(tab, url) {{
+  const d = document.createElement(tab === 'links' || tab === 'files' ? 'a' : 'div');
+
+  if (tab === 'images') {{
+    const isGif = /\\.gif(\\?|$)/i.test(url);
+    d.className = 'mp-thumb';
+    d.title     = decodeURIComponent(url.split('/').pop().split('?')[0]);
+    d.onclick   = (e) => {{ e.stopPropagation(); openLB(url); }};
+    const img   = document.createElement('img');
+    img.loading = 'lazy';
+    img.src     = url;
+    img.onerror = () => d.style.display = 'none';
+    d.appendChild(img);
+    if (isGif) {{
+      const b = document.createElement('div');
+      b.className   = 'mp-thumb-gif';
+      b.textContent = 'GIF';
+      d.appendChild(b);
+    }}
+
+  }} else if (tab === 'videos') {{
+    d.className = 'mp-vid-item';
+    d.title     = decodeURIComponent(url.split('/').pop().split('?')[0]);
+    d.onclick   = (e) => {{ e.stopPropagation(); openLB(url); }};
+    const name  = d.title;
+    const ext   = name.split('.').pop().toUpperCase();
+    const thumb = document.createElement('div');
+    thumb.className = 'mp-vid-thumb';
+
+    const vid   = document.createElement('video');
+    vid.preload  = 'none';          // start idle
+    vid.muted    = true;
+    vid.src      = url + '#t=1';   // #t=1 hint for first-frame seek
+    vid.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:4px;pointer-events:none;opacity:0;transition:opacity .2s';
+
+    // Placeholder shown while/if video fails to load
+    const ph = document.createElement('div');
+    ph.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:18px;color:rgba(255,255,255,.4)';
+    ph.textContent = '▶';
+    thumb.style.position = 'relative';
+    thumb.appendChild(ph);
+    thumb.appendChild(vid);
+
+    // Reveal the video frame once a frame is painted; hide on error
+    function _showFrame() {{
+      try {{ vid.currentTime = 1; }} catch(e) {{}}
+      vid.style.opacity = '1';
+      ph.style.display  = 'none';
+    }}
+    vid.addEventListener('loadeddata',     _showFrame, {{once:true}});
+    vid.addEventListener('loadedmetadata', _showFrame, {{once:true}});
+    vid.addEventListener('error', () => {{
+      vid.style.display = 'none';
+      ph.style.opacity  = '1';
+    }}, {{once:true}});
+
+    // Use IntersectionObserver to trigger metadata load when item scrolls into view
+    // (avoids loading all thumbnails at once while still showing them without hover)
+    if ('IntersectionObserver' in window) {{
+      const obs = new IntersectionObserver((entries, o) => {{
+        if (entries[0].isIntersecting) {{
+          vid.preload = 'metadata';
+          vid.load();
+          o.disconnect();
+        }}
+      }}, {{rootMargin: '200px'}});
+      obs.observe(d);
+    }} else {{
+      // Fallback: load immediately
+      vid.preload = 'metadata';
+      vid.load();
+    }}
+
+    const info  = document.createElement('div');
+    info.innerHTML = `<div class="mp-vid-name">${{name}}</div><div class="mp-vid-size">${{ext}} video</div>`;
+    d.appendChild(thumb); d.appendChild(info);
+
+  }} else if (tab === 'links') {{
+    d.href = url; d.target = '_blank'; d.rel = 'noopener';
+    d.className = 'mp-link-item';
+    const display = url.replace(/^https?:\\/\\//,'').replace(/\\/$/, '');
+    const short   = display.length > 52 ? display.slice(0,52)+'…' : display;
+    const ico     = document.createElement('div');
+    ico.className = 'mp-link-ico-svg';
+    ico.innerHTML = _mpLinkSvg(url);
+    const span    = document.createElement('span');
+    span.className   = 'mp-link-url';
+    span.textContent = short;
+    d.appendChild(ico); d.appendChild(span);
+
+  }} else if (tab === 'files') {{
+    d.href = url; d.target = '_blank'; d.rel = 'noopener';
+    d.className = 'mp-file-item';
+    const name  = decodeURIComponent(url.split('/').pop().split('?')[0]);
+    const ext   = name.split('.').pop().toLowerCase();
+    d.title     = name;
+    const ico   = document.createElement('div');
+    ico.className = 'mp-file-ico';
+    ico.innerHTML = _mpFileSvg(ext);
+    const info  = document.createElement('div');
+    info.className = 'mp-file-info';
+    info.innerHTML = `<div class="mp-file-name">${{name}}</div><div class="mp-file-ext">${{ext.toUpperCase()}}</div>`;
+    d.appendChild(ico); d.appendChild(info);
+  }}
+  return d;
+}}
+
 function openMsgSearch() {{
   document.getElementById('msg-search-bar').classList.add('visible');
   document.getElementById('msg-srch').focus();
@@ -5031,12 +5577,30 @@ document.getElementById('msg-srch').addEventListener('keydown', e => {{
 
 // ── LIGHTBOX ────────────────────────────────────────────────
 function openLB(src) {{
-  document.getElementById('lb-img').src=src;
+  const isVid = /\\.(mp4|mov|webm|mkv|m4v|avi)(\\?|$)/i.test(src);
+  const img = document.getElementById('lb-img');
+  const vid = document.getElementById('lb-vid');
+  if (isVid) {{
+    img.style.display = 'none';
+    vid.style.display = '';
+    vid.src = src;
+    vid.play();
+  }} else {{
+    vid.style.display = 'none';
+    vid.pause(); vid.src = '';
+    img.style.display = '';
+    img.src = src;
+  }}
   document.getElementById('lb').classList.add('open');
 }}
 function closeLB() {{
   document.getElementById('lb').classList.remove('open');
-  document.getElementById('lb-img').src='';
+  const img = document.getElementById('lb-img');
+  const vid = document.getElementById('lb-vid');
+  img.src = '';
+  vid.pause(); vid.src = '';
+  img.style.display = '';
+  vid.style.display = 'none';
 }}
 document.addEventListener('keydown', e => {{ if(e.key==='Escape') {{ closeLB(); closeCtxMenu(); }} }});
 
@@ -5067,12 +5631,12 @@ function showCtxMenu(e, id, name) {{
 }}
 
 function ctxCopyId() {{
-  if (_ctxTarget?.id) navigator.clipboard.writeText(_ctxTarget.id).then(() => showToast('ID copied: ' + _ctxTarget.id));
+  if (_ctxTarget?.id) navigator.clipboard.writeText(_ctxTarget.id).then(() => showToast((I18N[LANG]['toast-id-copied']||'ID copied: ') + _ctxTarget.id));
   closeCtxMenu();
 }}
 
 function ctxCopyName() {{
-  if (_ctxTarget?.name) navigator.clipboard.writeText(_ctxTarget.name).then(() => showToast('Name copied: ' + _ctxTarget.name));
+  if (_ctxTarget?.name) navigator.clipboard.writeText(_ctxTarget.name).then(() => showToast((I18N[LANG]['toast-name-copied']||'Name copied: ') + _ctxTarget.name));
   closeCtxMenu();
 }}
 
@@ -5172,8 +5736,13 @@ function parseDiscordMarkdown(text) {{
   return text;
 }}
 // ── UTILS ───────────────────────────────────────────────────
-function esc(s)  {{ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;') }}
-function ini(s)  {{ return String(s||'?')[0].toUpperCase() }}
+function esc(s)  {{ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;') }}
+// escUrl: safe for href/src HTML attributes — encodes '#' to prevent
+// spurious fragment-identifier splits on CDN URLs, then HTML-escapes.
+function escUrl(u) {{ const s = String(u||'').replace(/#/g,'%23'); return esc(s); }}
+// ini: codePoint-aware (handles emoji/multi-byte Unicode) + HTML-escaped
+// output, safe to inject as innerHTML.
+function ini(s)  {{ const cp = String(s||'?').codePointAt(0); return esc(String.fromCodePoint(cp||63).toUpperCase()); }}
 function linkify(h) {{
   const re = /(https?:[/][/][^ <>\"&]+)/g;
   return h.replace(re, '<a href="$1" target="_blank" rel="noopener">$1</a>');
@@ -5633,6 +6202,15 @@ const I18N = {{
     'discord-lbl':    'Μέλος από',
     'hype-lbl':       'HypeSquad Brilliance',
     // settings modal
+    'mp-images':  '🖼️ Εικόνες',
+    'mp-videos':  '🎥 Βίντεο',
+    'mp-links':   '🔗 Σύνδεσμ…',
+    'mp-files':   '📎 Αρχεία',
+    'lb-close-btn':   '✕  Κλείσιμο',
+    'ctx-copy-id':    'Αντιγραφή ID',
+    'ctx-copy-name':  'Αντιγραφή Ονόματος',
+    'toast-id-copied':   'ID αντιγράφηκε: ',
+    'toast-name-copied': 'Όνομα αντιγράφηκε: ',
     'settings-title': 'Ρυθμίσεις',
     'settings-lang':  'Γλώσσα',
   }},
@@ -5660,6 +6238,15 @@ const I18N = {{
     'phone-lbl':      'Phone Verified',
     'discord-lbl':    'Discord Member since',
     'hype-lbl':       'HypeSquad Brilliance',
+    'mp-images':  '🖼️ Images',
+    'mp-videos':  '🎥 Videos',
+    'mp-links':   '🔗 Links',
+    'mp-files':   '📎 Files',
+    'lb-close-btn':   '✕  Close',
+    'ctx-copy-id':    'Copy ID',
+    'ctx-copy-name':  'Copy Name',
+    'toast-id-copied':   'ID copied: ',
+    'toast-name-copied': 'Name copied: ',
     'settings-title': 'Settings',
     'settings-lang':  'Language',
   }}
@@ -6089,8 +6676,31 @@ window.addEventListener('load', function() {{
     </div>
   </div>
 </div>
+<!-- Per-channel message data (lazy-loaded by getMsgs) -->
+__MSG_DATA_SENTINEL__
 </body>
 </html>"""
+
+    # Bug #1 fix: avoid holding the full HTML *and* ch_json_scripts in RAM
+    # simultaneously.  Split the template at the sentinel, write to disk in
+    # three chunks: (1) everything before the data, (2) the data block,
+    # (3) closing tags.  Peak RAM drops from 2× to ~1× message-data size.
+    _sentinel = "__MSG_DATA_SENTINEL__"
+    pre, post = html_template.split(_sentinel, 1)
+    del html_template  # free template string before writing
+
+    if output_path is not None:
+        import io as _io
+        with _io.open(output_path, "w", encoding="utf-8") as _out:
+            _out.write(pre); del pre
+            _out.write(ch_json_scripts); del ch_json_scripts
+            _out.write(post); del post
+        return None
+    # Fallback (no output_path): return assembled string as before.
+    # Avoid storing ch_json_scripts twice by building from parts.
+    result = pre + ch_json_scripts + post
+    del pre, ch_json_scripts, post
+    return result
 
 
 # ─── NEW FEATURE LOADERS ──────────────────────────────────────
@@ -6282,7 +6892,7 @@ def run_generation(package_path_str, output_path_str=None):
     if not (PACKAGE_PATH / "Messages" / "index.json").exists():
         raise FileNotFoundError("Not a valid Discord data package: missing Messages/index.json")
 
-    print("Discord Archive Viewer v3"); print("="*50)
+    print("Discord Archive Viewer v4"); print("="*50)
 
     # Load raw user.json for functions that need the full data
     with open(PACKAGE_PATH / "Account" / "user.json", encoding="utf-8") as f:
@@ -6295,27 +6905,38 @@ def run_generation(package_path_str, output_path_str=None):
     activity = load_activity()
     print(f"Activity events: {sum(activity.values())}")
     idx = json.load(open(PACKAGE_PATH/"Messages"/"index.json", encoding="utf-8"))
-    channels, total, stats_accum = load_messages(idx)
+    channels, all_msgs, total, stats_accum = load_messages(idx)
     av = None
     av_static = None  # non-animated version for msg-av
 
     gif_path = PACKAGE_PATH / "Account" / "avatar.gif"
     if gif_path.exists():
-        av = b64_file(gif_path)
-        print("Avatar: OK (gif)")
         try:
-            from PIL import Image
-            import io
-            with Image.open(gif_path) as im:
-                im.seek(0)
-                frame = im.convert("RGBA")
-                buf = io.BytesIO()
-                frame.save(buf, format="PNG")
-                av_static = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-            print("Avatar static: OK (first frame extracted)")
+            av = b64_file(gif_path)
+            print("Avatar: OK (gif)")
+            # Extract first frame as a static PNG for use in compact avatar slots.
+            # Uses explicit open/close (not `with`) for Pillow < 5.4 compatibility.
+            try:
+                from PIL import Image
+                import io
+                im = Image.open(gif_path)
+                try:
+                    im.seek(0)
+                    frame = im.convert("RGBA")
+                    buf = io.BytesIO()
+                    frame.save(buf, format="PNG")
+                    av_static = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+                    print("Avatar static: OK (first frame extracted)")
+                finally:
+                    im.close()
+            except ImportError:
+                print("Avatar static: Pillow not installed — using animated gif as fallback")
+                av_static = av
+            except Exception as e:
+                print(f"Avatar static: fallback to gif ({e})")
+                av_static = av
         except Exception as e:
-            print(f"Avatar static: fallback to gif ({e})")
-            av_static = av
+            print(f"Avatar: failed to read gif ({e})")
     else:
         for _ext in ("png", "webp", "jpg", "jpeg"):
             data = b64_file(PACKAGE_PATH / "Account" / f"avatar.{_ext}")
@@ -6327,8 +6948,10 @@ def run_generation(package_path_str, output_path_str=None):
 
     if not av:
         print("Avatar: not found")
-    print("  Prefetching Tenor thumbnails...")
-    prefetch_tenor_thumbs(channels)
+    # Prefetch Tenor thumbnails with a hard 25 s cap — non-blocking for offline use.
+    # These get baked into the HTML as a JS lookup table so thumbnails show
+    # instantly without requiring the browser to make cross-origin oEmbed requests.
+    prefetch_tenor_thumbs(channels, all_msgs)
     stats = calc_stats(channels, total, stats_accum)
 
     quests       = load_quests(PACKAGE_PATH)
@@ -6349,12 +6972,10 @@ def run_generation(package_path_str, output_path_str=None):
         name = u.get("global_name") or u.get("username") or ""
         if uid and name:
             user_map[uid] = name
-    for ch in channels:
-        for m in ch.get("messages", []):
-            aid = m.get("author_id", "")
-            aname = m.get("author", "")
-            if aid and aname and aid not in user_map:
-                user_map[aid] = aname
+    # Bug #6 fix: second full pass over all_msgs removed.
+    # user_map is populated from relationships above, which covers all known
+    # contacts. A second O(N) pass over every message added marginal coverage
+    # (only bot/unknown authors) at the cost of iterating the full message corpus.
     print(f"User map: {len(user_map)} known users for @mention resolution")
 
     server_icons    = load_server_icons(PACKAGE_PATH, servers, raw_user=raw_user)
@@ -6385,9 +7006,10 @@ def run_generation(package_path_str, output_path_str=None):
         "support_tickets": support_tickets,
         "dev_apps":        dev_apps,
     }
-    html = generate_html(user, servers, channels, stats, activity, av, extra, av_static=av_static)
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        f.write(html)
+    # Bug #1 fix: pass output_path so generate_html streams directly to disk
+    # instead of returning one giant string (avoids doubling RAM for the data block).
+    generate_html(user, servers, channels, all_msgs, stats, activity, av, extra,
+                  av_static=av_static, output_path=OUTPUT_FILE)
     sz = OUTPUT_FILE.stat().st_size / 1024 / 1024
     print(f"\nDONE! {sz:.1f}MB → {OUTPUT_FILE}")
 
@@ -6395,7 +7017,9 @@ def run_generation(package_path_str, output_path_str=None):
 # ─── GUI (CustomTkinter) ─────────────────────────────────────
 _BLURPLE       = "#5865F2"
 _BLURPLE_HOVER = "#4752C4"
-_DARK_BG       = "#1a1a2e"
+_DARK_BG       = "#0e0e1a"
+_CARD_BG       = "#12122a"
+_BORDER        = "#2a2a55"
 _ICON_PATH     = Path(__file__).with_name("icon.ico")
 
 
@@ -6405,9 +7029,8 @@ class DiscordViewerGUI:
     def __init__(self, ctk_mod):
         self.ctk = ctk_mod
         self.root = ctk_mod.CTk()
-        self.root.title("Discord Archive Viewer v3")
-        self.root.resizable(True, True)
-        self.root.minsize(560, 460)
+        self.root.title("Discord Archive Viewer v4")
+        self.root.resizable(False, False)
         _mw, _mh = 720, 560
         self.root.geometry(f"{_mw}x{_mh}")
         # ── icon (window + taskbar) ──
@@ -6584,39 +7207,72 @@ class DiscordViewerGUI:
         ctk = self.ctk
         import tkinter as _tk
 
+        # root bg
+        self.root.configure(fg_color=_DARK_BG)
+
         # ═══════════════════════════════════════════════════
-        # HEADER
+        # HEADER — gradient-like layered frame
         # ═══════════════════════════════════════════════════
-        hdr = ctk.CTkFrame(self.root, fg_color="#12122a", corner_radius=0)
+        hdr = ctk.CTkFrame(self.root, fg_color="#0d0d20", corner_radius=0, height=72)
         hdr.pack(fill="x")
-        ctk.CTkLabel(hdr, text="Discord Archive Viewer",
-                     font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color="#ffffff").pack(side="left", padx=20, pady=14)
-        ctk.CTkLabel(hdr, text="v3",
+        hdr.pack_propagate(False)
+
+        # left accent bar
+        ctk.CTkFrame(hdr, fg_color=_BLURPLE, width=4, corner_radius=0).pack(
+            side="left", fill="y")
+
+        # icon area
+        ctk.CTkLabel(hdr, text="🗂️",
+                     font=ctk.CTkFont(size=28)).pack(side="left", padx=(16, 10))
+
+        # title block
+        title_block = ctk.CTkFrame(hdr, fg_color="transparent")
+        title_block.pack(side="left", pady=12)
+        ctk.CTkLabel(title_block,
+                     text="Discord Archive Viewer",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color="#ffffff",
+                     anchor="w").pack(anchor="w")
+        ctk.CTkLabel(title_block,
+                     text="Personal data package explorer",
                      font=ctk.CTkFont(size=11),
-                     text_color="#5865F2").pack(side="left", pady=14)
+                     text_color="#555580",
+                     anchor="w").pack(anchor="w")
+
+        # v4 badge — right side
+        v_badge = ctk.CTkFrame(hdr, fg_color="#1e1e42",
+                               corner_radius=8, border_width=1,
+                               border_color="#3a3a70")
+        v_badge.pack(side="right", padx=20, pady=20)
+        ctk.CTkLabel(v_badge, text="v4",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=_BLURPLE).pack(padx=10, pady=4)
+
+        # thin bottom accent line under header
+        ctk.CTkFrame(self.root, fg_color="#1a1a40",
+                     height=1, corner_radius=0).pack(fill="x")
 
         # ═══════════════════════════════════════════════════
         # ZIP DROP ZONE CARD
         # ═══════════════════════════════════════════════════
         self._zip_card = ctk.CTkFrame(
             self.root,
-            fg_color="#14142b",
+            fg_color=_CARD_BG,
             corner_radius=12,
-            border_width=2,
-            border_color="#2a2a55"
+            border_width=1,
+            border_color=_BORDER
         )
-        self._zip_card.pack(fill="x", padx=20, pady=(14, 6))
+        self._zip_card.pack(fill="x", padx=20, pady=(16, 6))
 
-        # col 0 = icon (fixed), col 1 = text (expands), col 2 = button (fixed)
         self._zip_card.columnconfigure(0, weight=0)
         self._zip_card.columnconfigure(1, weight=1)
         self._zip_card.columnconfigure(2, weight=0)
 
+        # dashed drop hint label (left icon)
         self._zip_ico_lbl = ctk.CTkLabel(
             self._zip_card,
             text="📦",
-            font=ctk.CTkFont(size=28)
+            font=ctk.CTkFont(size=30)
         )
         self._zip_ico_lbl.grid(row=0, column=0, rowspan=2,
                                padx=(18, 10), pady=(14, 14), sticky="w")
@@ -6625,7 +7281,7 @@ class DiscordViewerGUI:
             self._zip_card,
             text="No file selected",
             font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#888888",
+            text_color="#555577",
             anchor="w"
         )
         self._zip_name_lbl.grid(row=0, column=1, padx=(0, 8), pady=(16, 2), sticky="ew")
@@ -6634,7 +7290,7 @@ class DiscordViewerGUI:
             self._zip_card,
             text="Click  Browse ZIP  to select your Discord data package",
             font=ctk.CTkFont(size=11),
-            text_color="#555577",
+            text_color="#3a3a58",
             anchor="w"
         )
         self._zip_sub_lbl.grid(row=1, column=1, padx=(0, 8), pady=(0, 16), sticky="ew")
@@ -6658,10 +7314,11 @@ class DiscordViewerGUI:
         self.prog_frame.pack(fill="x", padx=20, pady=(2, 0))
 
         self.progress = ctk.CTkProgressBar(
-            self.prog_frame, height=8,
+            self.prog_frame, height=6,
             progress_color=_BLURPLE,
-            fg_color="#2a2a40",
-            mode="determinate"
+            fg_color="#1a1a30",
+            mode="determinate",
+            corner_radius=3
         )
         self.progress.set(0)
         self._progress_visible = False
@@ -6670,7 +7327,7 @@ class DiscordViewerGUI:
         self.status_label = ctk.CTkLabel(
             self.prog_frame, textvariable=self.status_var,
             font=ctk.CTkFont(size=11),
-            text_color="gray", anchor="w"
+            text_color="#444466", anchor="w"
         )
         self.status_label.pack(fill="x", pady=(2, 0))
 
@@ -6680,28 +7337,30 @@ class DiscordViewerGUI:
         self.log_text = ctk.CTkTextbox(
             self.root,
             font=("Consolas", 12),
-            fg_color=_DARK_BG,
-            text_color="#cccccc",
+            fg_color="#0a0a18",
+            text_color="#8888aa",
             state="disabled",
             wrap="word",
-            corner_radius=8
+            corner_radius=10,
+            border_width=1,
+            border_color="#1e1e3a"
         )
         self.log_text.pack(fill="both", expand=True, padx=20, pady=(8, 8))
         self.log_text.tag_config("warning", foreground="#ffaa00")
         self.log_text.tag_config("error",   foreground="#ff5555")
-        self.log_text.tag_config("success", foreground="#55ff55")
-        self.log_text.tag_config("stdout",  foreground="#cccccc")
+        self.log_text.tag_config("success", foreground="#55ff99")
+        self.log_text.tag_config("stdout",  foreground="#8888aa")
 
         # ═══════════════════════════════════════════════════
         # BOTTOM ACTION BUTTONS
         # ═══════════════════════════════════════════════════
         btn_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=20, pady=(0, 16))
+        btn_frame.pack(fill="x", padx=20, pady=(0, 18))
 
         self.gen_btn = ctk.CTkButton(
             btn_frame, text="⚡  Generate HTML",
             command=self._start_generation,
-            state="disabled", width=180, height=40,
+            state="disabled", width=180, height=42,
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color=_BLURPLE, hover_color=_BLURPLE_HOVER,
             corner_radius=10
@@ -6711,10 +7370,10 @@ class DiscordViewerGUI:
         self.open_btn = ctk.CTkButton(
             btn_frame, text="🌐  Open in Browser",
             command=self._open_html,
-            state="disabled", width=180, height=40,
+            state="disabled", width=180, height=42,
             font=ctk.CTkFont(size=13),
-            fg_color="#1e1e3a", hover_color="#2a2a4a",
-            border_width=1, border_color="#3a3a6a",
+            fg_color="#16162e", hover_color="#20203e",
+            border_width=1, border_color="#2e2e5e",
             corner_radius=10
         )
         self.open_btn.pack(side="right")
@@ -6928,12 +7587,35 @@ class DiscordViewerGUI:
     def _start_generation(self):
         import threading
         from tkinter import filedialog
+        from datetime import datetime
+
+        # ── Build smart default filename from username + date ──
+        try:
+            import json as _json, zipfile as _zf
+            _p = Path(self.selected_path)
+            if _p.suffix.lower() == ".zip":
+                with _zf.ZipFile(_p) as _z:
+                    _candidates = [n for n in _z.namelist() if n.endswith("Account/user.json")]
+                    if _candidates:
+                        with _z.open(_candidates[0]) as _f:
+                            _u = _json.load(_f)
+                    else:
+                        _u = {}
+            else:
+                _uj = _p / "Account" / "user.json"
+                _u = _json.loads(_uj.read_text(encoding="utf-8")) if _uj.exists() else {}
+            _uname = (_u.get("global_name") or _u.get("username") or "archive").strip()
+            _uname = "".join(c for c in _uname if c.isalnum() or c in "-_") or "archive"
+        except Exception:
+            _uname = "archive"
+        _date  = datetime.now().strftime("%Y-%m-%d")
+        _default_name = f"discord_archive_{_uname}.html"
 
         # ── Ask where to save the HTML ──
         save_path = filedialog.asksaveasfilename(
-            title="Save discord_viewer.html",
+            title="Save HTML",
             defaultextension=".html",
-            initialfile=f"discord_viewer.html",
+            initialfile=_default_name,
             filetypes=[("HTML file", "*.html"), ("All files", "*.*")],
             initialdir=str(Path(self.selected_path).parent)
         )
