@@ -35,6 +35,15 @@ def b64_file(path):
     mime = {"gif":"image/gif","png":"image/png","jpg":"image/jpeg","jpeg":"image/jpeg","webp":"image/webp"}.get(ext,"application/octet-stream")
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
 
+# Embed browser-icon.ico as base64 favicon
+def _load_ico():
+    for name in ("browser-icon.ico", "icon.ico"):
+        ico = Path(__file__).parent / name
+        if ico.exists():
+            return f"data:image/x-icon;base64,{base64.b64encode(ico.read_bytes()).decode()}"
+    return ""
+ICO_B64 = _load_ico()
+
 def name_to_color(name):
     """Generate a consistent HSL color from a name string."""
     h = int(hashlib.md5(name.encode()).hexdigest()[:4], 16) % 360
@@ -835,6 +844,7 @@ let contentHtml = linkify(raw);
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Discord Archive · {user.get('global_name','')}</title>
+<link rel="icon" type="image/x-icon" href="{ICO_B64}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
