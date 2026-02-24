@@ -41,12 +41,34 @@ def name_to_color(name):
     return h
 
 # ─── GUI STDOUT / LOG HELPERS ────────────────────────────
+
+# Status keywords: map print output → friendly status string
+_STATUS_PATTERNS = [
+    ("Extracting",       "Extracting ZIP…"),
+    ("Extraction complete", "Extraction complete"),
+    ("Φορτώνω",          "Loading messages…"),
+    ("Fetching",         "Fetching Tenor thumbnails…"),
+    ("Δημιουργώ HTML",   "Generating HTML…"),
+    ("DONE!",            "Complete!"),
+    ("User:",            "Loaded user profile"),
+    ("Servers:",         "Loaded servers"),
+    ("Activity events:", "Loaded activity"),
+    ("Quests:",          "Loading extras…"),
+    ("User map:",        "Resolving @mentions…"),
+]
+
+
+import re as _re
+_PCT_RE = _re.compile(r'(\d+)/(\d+)\s+files\s+\((\d+)%\)')
+
 class TextRedirector:
-    """Intercepts stdout/stderr writes and mirrors them to a Tkinter Text widget."""
-    def __init__(self, text_widget, original, tag="stdout"):
+    """Intercepts stdout/stderr writes → Text widget + optional status label."""
+    def __init__(self, text_widget, original, tag="stdout", status_var=None, progress_ref=None):
         self.text_widget = text_widget
         self.original = original
         self.tag = tag
+        self.status_var = status_var
+        self.progress_ref = progress_ref   # (CTkProgressBar, tk_root) or None
         self.encoding = "utf-8"
         self.errors = "replace"
 
@@ -64,7 +86,27 @@ class TextRedirector:
             self.text_widget.see("end")
             self.text_widget.configure(state="disabled")
         except Exception:
-            pass  # widget destroyed (user closed window mid-generation)
+            pass
+        # Update status label from key phrases
+        if self.status_var and s.strip():
+            for keyword, status in _STATUS_PATTERNS:
+                if keyword in s:
+                    try: self.status_var.set(status)
+                    except Exception: pass
+                    break
+        # Update progress bar with extraction percentage
+        if self.progress_ref and s.strip():
+            m = _PCT_RE.search(s)
+            if m:
+                done, total, pct = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                bar, root = self.progress_ref
+                try:
+                    bar.configure(mode="determinate")
+                    bar.set(pct / 100)
+                    if self.status_var:
+                        self.status_var.set(f"Extracting…  {done:,} / {total:,}  ({pct}%)")
+                except Exception:
+                    pass
 
     def flush(self):
         if self.original:
@@ -5113,15 +5155,45 @@ window.addEventListener('load', function() {{
 
 
 # ─── CORE GENERATION ─────────────────────────────────────────
-def run_generation(package_path_str):
+def run_generation(package_path_str, output_path_str=None):
     """Run the full generation pipeline.  Called by both CLI and GUI modes."""
     global PACKAGE_PATH, OUTPUT_FILE
-    PACKAGE_PATH = Path(package_path_str)
-    OUTPUT_FILE  = PACKAGE_PATH.parent / "discord_viewer.html"
+    import zipfile as _zf
+
+    input_path = Path(package_path_str)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Not found: {input_path}")
+
+    # ── ZIP handling: extract automatically ──
+    if input_path.suffix.lower() == ".zip":
+        if not _zf.is_zipfile(input_path):
+            raise ValueError(f"Not a valid ZIP file: {input_path.name}")
+        extract_dir = input_path.with_suffix("")          # package.zip → package/
+        with _zf.ZipFile(input_path, "r") as zf:
+            members = zf.namelist()
+            total = len(members)
+            step = max(1, total // 20)   # ~5% increments
+            print(f"Extracting {input_path.name} ({total:,} files) …")
+            for i, member in enumerate(members, 1):
+                zf.extract(member, extract_dir)
+                if i % step == 0 or i == total:
+                    pct = i * 100 // total
+                    print(f"  {i:,}/{total:,} files ({pct}%)")
+        print(f"Extraction complete → {extract_dir.name}/")
+        # Some ZIPs have a single top-level folder; detect and unwrap
+        if not (extract_dir / "Account" / "user.json").exists():
+            subs = [d for d in extract_dir.iterdir() if d.is_dir()]
+            if len(subs) == 1 and (subs[0] / "Account" / "user.json").exists():
+                extract_dir = subs[0]
+        PACKAGE_PATH = extract_dir
+        _default_out = input_path.parent / "discord_viewer.html"
+    else:
+        PACKAGE_PATH = input_path
+        _default_out = PACKAGE_PATH.parent / "discord_viewer.html"
+
+    OUTPUT_FILE = Path(output_path_str) if output_path_str else _default_out
 
     # ── Validate ──
-    if not PACKAGE_PATH.exists():
-        raise FileNotFoundError(f"Folder not found: {PACKAGE_PATH}")
     if not (PACKAGE_PATH / "Account" / "user.json").exists():
         raise FileNotFoundError("Not a valid Discord data package: missing Account/user.json")
     if not (PACKAGE_PATH / "Messages" / "index.json").exists():
@@ -5219,17 +5291,48 @@ def run_generation(package_path_str):
     print(f"\nDONE! {sz:.1f}MB → {OUTPUT_FILE}")
 
 
-# ─── GUI ─────────────────────────────────────────────────────
-class DiscordViewerGUI:
-    """Tkinter GUI: folder picker → progress log → open result in browser."""
+# ─── GUI (CustomTkinter) ─────────────────────────────────────
+_BLURPLE       = "#5865F2"
+_BLURPLE_HOVER = "#4752C4"
+_DARK_BG       = "#1a1a2e"
+_ICON_PATH     = Path(__file__).with_name("icon.ico")
 
-    def __init__(self, tk_mod):
-        self.tk = tk_mod
-        self.root = tk_mod.Tk()
+
+class DiscordViewerGUI:
+    """Modern dark GUI using CustomTkinter — ZIP-only workflow."""
+
+    def __init__(self, ctk_mod):
+        self.ctk = ctk_mod
+        self.root = ctk_mod.CTk()
         self.root.title("Discord Archive Viewer v3")
-        self.root.geometry("660x500")
         self.root.resizable(True, True)
-        self.root.minsize(520, 400)
+        self.root.minsize(560, 460)
+        _mw, _mh = 720, 560
+        self.root.geometry(f"{_mw}x{_mh}")
+        # ── icon (window + taskbar) ──
+        if _ICON_PATH.exists():
+            _ico = str(_ICON_PATH)
+            def _set_icon():
+                try: self.root.iconbitmap(default=_ico)
+                except Exception: pass
+                try: self.root.iconbitmap(_ico)
+                except Exception: pass
+                try: self.root.wm_iconbitmap(_ico)
+                except Exception: pass
+            _set_icon()
+            self.root.after(100, _set_icon)
+            self.root.after(300, _set_icon)
+        elif not _ICON_PATH.exists():
+            # icon.ico not found — show custom warning once at startup
+            def _warn_icon():
+                self._show_error(
+                    "Icon Not Found",
+                    f"icon.ico not found next to the script.\n"
+                    f"Expected: {_ICON_PATH}\n\n"
+                    f"Place icon.ico in the same folder as\n"
+                    f"generate_discord_viewer.py to enable the icon."
+                )
+            self.root.after(400, _warn_icon)
 
         self.selected_path = None
         self.output_path   = None
@@ -5238,93 +5341,531 @@ class DiscordViewerGUI:
         self._log_handler  = None
 
         self._build_ui()
+        # Show the English warning modal after the window is drawn
+        self.root.after(120, self._show_english_warning)
 
-    # ── UI layout ──────────────────────────────────────────
+    def _setup_popup(self, dlg, dw: int, dh: int) -> None:
+        import sys as _sys
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+        dlg.attributes("-topmost", True)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+        scale = self.root._get_window_scaling()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = int(((sw / 2) - (dw / 2)) * scale)
+        y = int(((sh / 2) - (dh / 2)) * scale)
+        dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+        if _ICON_PATH.exists():
+            _ico = str(_ICON_PATH)
+            def _set_dlg_icon():
+                try: dlg.iconbitmap(default=_ico)
+                except Exception: pass
+                try: dlg.iconbitmap(_ico)
+                except Exception: pass
+                try: dlg.wm_iconbitmap(_ico)
+                except Exception: pass
+            dlg.after(50,  _set_dlg_icon)
+            dlg.after(150, _set_dlg_icon)
+            dlg.after(350, _set_dlg_icon)
+        def _harden():
+            if _sys.platform != "win32": return
+            try:
+                import ctypes as _ct
+                hwnd = _ct.windll.user32.GetParent(dlg.winfo_id())
+                if not hwnd: return
+                GWL_STYLE = -16
+                sty = _ct.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+                sty &= ~(0x00020000 | 0x00010000)  # no WS_MINIMIZEBOX / WS_MAXIMIZEBOX
+                _ct.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, sty)
+                _ct.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+                hmenu = _ct.windll.user32.GetSystemMenu(hwnd, False)
+                if hmenu:
+                    _ct.windll.user32.EnableMenuItem(hmenu, 0xF060, 0x0001)  # SC_CLOSE | MF_GRAYED
+            except Exception: pass
+        dlg.after(130, _harden)
+
+    @staticmethod
+    def _close_popup(dlg) -> None:
+        try: dlg.attributes("-topmost", False)
+        except Exception: pass
+        try: dlg.grab_release()
+        except Exception: pass
+        try: dlg.destroy()
+        except Exception: pass
+
+    # English warning modal ─────────────────────────
+    def _show_english_warning(self):
+        ctk = self.ctk
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Important — Read Before Continuing")
+        self._setup_popup(dlg, 640, 480)
+
+        # orange accent bar at top
+        ctk.CTkFrame(dlg, fg_color="#ff9900", height=7, corner_radius=0).pack(fill="x")
+
+        # ── icon + bold title — fully centered ──
+        ctk.CTkLabel(
+            dlg, text="⚠️",
+            font=ctk.CTkFont(size=52),
+            anchor="center"
+        ).pack(pady=(28, 6))
+
+        ctk.CTkLabel(
+            dlg,
+            text="Discord Language Must Be English",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#ffcc44",
+            justify="center",
+            anchor="center"
+        ).pack(padx=30, pady=(0, 6))
+
+        # divider
+        ctk.CTkFrame(dlg, fg_color="#444466", height=2, corner_radius=0).pack(fill="x", padx=40, pady=(8, 18))
+
+        # body text — centered
+        body = (
+            "This tool only works with Discord data packages requested\n"
+            "while Discord's interface language was set to  English.\n\n"
+            "If your Discord is set to another language  (Greek, French,\n"
+            "German, Spanish …)  the folder structure will differ and the\n"
+            "viewer will fail or display incorrect data.\n\n"
+            "Before requesting your data package, go to:\n"
+            "Discord Settings  →  Language  →  Select  English"
+        )
+        ctk.CTkLabel(
+            dlg,
+            text=body,
+            font=ctk.CTkFont(size=14),
+            text_color="#d0d0d0",
+            justify="center",
+            anchor="center"
+        ).pack(padx=40, pady=(0, 24), fill="x")
+
+        # confirm button — centered
+        ctk.CTkButton(
+            dlg,
+            text="✓  I Understand, Continue",
+            width=260, height=46,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#ff9900",
+            hover_color="#cc7700",
+            text_color="#000000",
+            corner_radius=12,
+            command=lambda: self._close_popup(dlg)
+        ).pack(pady=(0, 30))
+
+        dlg.bind("<Return>", lambda e: self._close_popup(dlg))
+        dlg.after(80, dlg.focus_force)
+
+    # ── custom error dialog (replaces messagebox) ─────────
+    def _show_error(self, title, message):
+        ctk = self.ctk
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(title)
+        self._setup_popup(dlg, 440, 240)
+
+        ctk.CTkLabel(dlg, text=title,
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color="#ff5555").pack(pady=(20, 6))
+        ctk.CTkLabel(dlg, text=message,
+                     font=ctk.CTkFont(size=12), text_color="gray",
+                     wraplength=360, justify="center").pack(padx=20, pady=(0, 16))
+        ctk.CTkButton(dlg, text="OK", width=100, fg_color=_BLURPLE,
+                      hover_color=_BLURPLE_HOVER,
+                      command=lambda: self._close_popup(dlg)).pack(pady=(0, 16))
+        dlg.bind("<Return>", lambda e: self._close_popup(dlg))
+        dlg.after(50, dlg.focus_force)
+
+    # ── layout ─────────────────────────────────────────────
     def _build_ui(self):
-        tk = self.tk
-        pad = dict(padx=12, pady=6)
+        ctk = self.ctk
+        import tkinter as _tk
 
-        # ── top: folder selector ──
-        top = tk.Frame(self.root)
-        top.pack(fill="x", **pad)
+        # ═══════════════════════════════════════════════════
+        # HEADER
+        # ═══════════════════════════════════════════════════
+        hdr = ctk.CTkFrame(self.root, fg_color="#12122a", corner_radius=0)
+        hdr.pack(fill="x")
+        ctk.CTkLabel(hdr, text="Discord Archive Viewer",
+                     font=ctk.CTkFont(size=22, weight="bold"),
+                     text_color="#ffffff").pack(side="left", padx=20, pady=14)
+        ctk.CTkLabel(hdr, text="v3",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#5865F2").pack(side="left", pady=14)
 
-        tk.Label(top, text="Discord Data Package Folder:", anchor="w").pack(fill="x")
+        # ═══════════════════════════════════════════════════
+        # ZIP DROP ZONE CARD
+        # ═══════════════════════════════════════════════════
+        self._zip_card = ctk.CTkFrame(
+            self.root,
+            fg_color="#14142b",
+            corner_radius=12,
+            border_width=2,
+            border_color="#2a2a55"
+        )
+        self._zip_card.pack(fill="x", padx=20, pady=(14, 6))
 
-        row = tk.Frame(top)
-        row.pack(fill="x", pady=(4, 0))
+        # col 0 = icon (fixed), col 1 = text (expands), col 2 = button (fixed)
+        self._zip_card.columnconfigure(0, weight=0)
+        self._zip_card.columnconfigure(1, weight=1)
+        self._zip_card.columnconfigure(2, weight=0)
 
-        self.path_var = tk.StringVar(value="(no folder selected)")
-        tk.Label(row, textvariable=self.path_var, relief="sunken",
-                 anchor="w", padx=6, pady=4).pack(side="left", fill="x", expand=True)
+        self._zip_ico_lbl = ctk.CTkLabel(
+            self._zip_card,
+            text="📦",
+            font=ctk.CTkFont(size=28)
+        )
+        self._zip_ico_lbl.grid(row=0, column=0, rowspan=2,
+                               padx=(18, 10), pady=(14, 14), sticky="w")
 
-        self.browse_btn = tk.Button(row, text="Browse …", command=self._browse)
-        self.browse_btn.pack(side="right", padx=(8, 0))
+        self._zip_name_lbl = ctk.CTkLabel(
+            self._zip_card,
+            text="No file selected",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#888888",
+            anchor="w"
+        )
+        self._zip_name_lbl.grid(row=0, column=1, padx=(0, 8), pady=(16, 2), sticky="ew")
 
-        # ── middle: log output ──
-        mid = tk.Frame(self.root)
-        mid.pack(fill="both", expand=True, padx=12)
+        self._zip_sub_lbl = ctk.CTkLabel(
+            self._zip_card,
+            text="Click  Browse ZIP  to select your Discord data package",
+            font=ctk.CTkFont(size=11),
+            text_color="#555577",
+            anchor="w"
+        )
+        self._zip_sub_lbl.grid(row=1, column=1, padx=(0, 8), pady=(0, 16), sticky="ew")
 
-        self.log_text = tk.Text(mid, height=18, state="disabled", wrap="word",
-                                font=("Consolas", 9), bg="#1a1a2e", fg="#cccccc",
-                                insertbackground="#cccccc", relief="sunken", bd=2)
-        sb = tk.Scrollbar(mid, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.log_text.pack(side="left", fill="both", expand=True)
+        self.browse_btn = ctk.CTkButton(
+            self._zip_card,
+            text="Browse ZIP…",
+            command=self._browse_zip,
+            width=130, height=36,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=_BLURPLE, hover_color=_BLURPLE_HOVER,
+            corner_radius=8
+        )
+        self.browse_btn.grid(row=0, column=2, rowspan=2,
+                             padx=(12, 18), pady=14, sticky="e")
 
-        self.log_text.tag_configure("warning", foreground="#ffaa00")
-        self.log_text.tag_configure("error",   foreground="#ff5555")
-        self.log_text.tag_configure("success", foreground="#55ff55")
+        # ═══════════════════════════════════════════════════
+        # PROGRESS BAR  (hidden until generation starts)
+        # ═══════════════════════════════════════════════════
+        self.prog_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.prog_frame.pack(fill="x", padx=20, pady=(2, 0))
 
-        # ── bottom: action buttons ──
-        bot = tk.Frame(self.root)
-        bot.pack(fill="x", **pad)
+        self.progress = ctk.CTkProgressBar(
+            self.prog_frame, height=8,
+            progress_color=_BLURPLE,
+            fg_color="#2a2a40",
+            mode="determinate"
+        )
+        self.progress.set(0)
+        self._progress_visible = False
 
-        self.gen_btn = tk.Button(bot, text="✦  Generate HTML", width=20,
-                                 command=self._start_generation, state="disabled")
+        self.status_var = _tk.StringVar(value="")
+        self.status_label = ctk.CTkLabel(
+            self.prog_frame, textvariable=self.status_var,
+            font=ctk.CTkFont(size=11),
+            text_color="gray", anchor="w"
+        )
+        self.status_label.pack(fill="x", pady=(2, 0))
+
+        # ═══════════════════════════════════════════════════
+        # LOG TEXTBOX
+        # ═══════════════════════════════════════════════════
+        self.log_text = ctk.CTkTextbox(
+            self.root,
+            font=("Consolas", 12),
+            fg_color=_DARK_BG,
+            text_color="#cccccc",
+            state="disabled",
+            wrap="word",
+            corner_radius=8
+        )
+        self.log_text.pack(fill="both", expand=True, padx=20, pady=(8, 8))
+        self.log_text.tag_config("warning", foreground="#ffaa00")
+        self.log_text.tag_config("error",   foreground="#ff5555")
+        self.log_text.tag_config("success", foreground="#55ff55")
+        self.log_text.tag_config("stdout",  foreground="#cccccc")
+
+        # ═══════════════════════════════════════════════════
+        # BOTTOM ACTION BUTTONS
+        # ═══════════════════════════════════════════════════
+        btn_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=(0, 16))
+
+        self.gen_btn = ctk.CTkButton(
+            btn_frame, text="⚡  Generate HTML",
+            command=self._start_generation,
+            state="disabled", width=180, height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=_BLURPLE, hover_color=_BLURPLE_HOVER,
+            corner_radius=10
+        )
         self.gen_btn.pack(side="left")
 
-        self.open_btn = tk.Button(bot, text="Open in Browser", width=20,
-                                  command=self._open_html, state="disabled")
+        self.open_btn = ctk.CTkButton(
+            btn_frame, text="🌐  Open in Browser",
+            command=self._open_html,
+            state="disabled", width=180, height=40,
+            font=ctk.CTkFont(size=13),
+            fg_color="#1e1e3a", hover_color="#2a2a4a",
+            border_width=1, border_color="#3a3a6a",
+            corner_radius=10
+        )
         self.open_btn.pack(side="right")
 
     # ── actions ────────────────────────────────────────────
-    def _browse(self):
-        from tkinter import filedialog, messagebox
-        folder = filedialog.askdirectory(title="Select your Discord data package folder")
-        if not folder:
-            return
-        p = Path(folder)
-        if not (p / "Account" / "user.json").exists():
-            messagebox.showerror(
-                "Invalid Folder",
-                "This folder doesn't look like a Discord data package.\n\n"
-                "Expected:  Account/user.json\n\n"
-                "Make sure you selected the extracted package folder.")
-            return
-        self.selected_path = folder
-        self.path_var.set(folder)
+    def _set_path(self, path):
+        self.selected_path = path
+        p = Path(path)
+        # Update card labels
+        self._zip_name_lbl.configure(
+            text=p.name,
+            text_color="#ffffff"
+        )
+        self._zip_sub_lbl.configure(
+            text=f"✅  Ready to generate  —  {p.stat().st_size / 1024 / 1024:.1f} MB",
+            text_color="#55bb77"
+        )
+        self._zip_card.configure(border_color="#5865F2")
         self.gen_btn.configure(state="normal")
         self.open_btn.configure(state="disabled")
+        # reset progress bar appearance for a fresh run
+        if self._progress_visible:
+            self.progress.configure(mode="determinate",
+                                    progress_color=_BLURPLE,
+                                    fg_color="#2a2a40")
+            self.progress.set(0)
+        self.status_var.set("")
         self.output_path = None
+
+    # ── Detect non-English Discord package ─────────────
+    def _detect_package_language(self, zip_path: str):
+        """Peek inside the ZIP without extracting.
+        Returns (is_english: bool, detected_lang: str, non_english_folders: list)."""
+        import zipfile as _zf
+        # Expected top-level English folder names in a Discord data package
+        ENGLISH_FOLDERS = {
+            "Account", "Messages", "Servers", "Activity",
+            "Ads", "Activities", "Programs"
+        }
+        # Known non-English translations of key folder names
+        NON_ENGLISH_HINTS = {
+            # Greek
+            "Λογαριασμός": "Greek", "Μηνύματα": "Greek", "Διακομιστές": "Greek",
+            "Δραστηριότητα": "Greek", "Σύνδεσμοι": "Greek",
+            # French
+            "Compte": "French", "Messages": None, "Serveurs": "French",
+            "Activité": "French",
+            # German
+            "Konto": "German", "Nachrichten": "German", "Server": None,
+            "Aktivität": "German",
+            # Spanish
+            "Cuenta": "Spanish", "Mensajes": "Spanish", "Servidores": "Spanish",
+            "Actividad": "Spanish",
+            # Portuguese
+            "Conta": "Portuguese", "Mensagens": "Portuguese",
+            # Italian
+            "Account": None, "Messaggi": "Italian", "Attività": "Italian",
+            # Dutch
+            "Berichten": "Dutch", "Activiteit": "Dutch",
+            # Russian
+            "Аккаунт": "Russian", "Сообщения": "Russian", "Серверы": "Russian",
+            # Turkish
+            "Hesap": "Turkish", "Mesajlar": "Turkish", "Sunucular": "Turkish",
+            # Polish
+            "Konto": "Polish", "Wiadomości": "Polish", "Serwery": "Polish",
+        }
+        try:
+            with _zf.ZipFile(zip_path, "r") as zf:
+                names = zf.namelist()
+            # Collect unique top-level folder names
+            top_folders = set()
+            for n in names:
+                part = n.split("/")[0].strip()
+                if part:
+                    top_folders.add(part)
+            # Also handle single-wrapper: zip → one_folder → Account, ...
+            # If Account not directly present, check one level deeper
+            sub_folders = set()
+            for n in names:
+                parts = n.split("/")
+                if len(parts) >= 2 and parts[1].strip():
+                    sub_folders.add(parts[1].strip())
+
+            folders_to_check = top_folders | sub_folders
+
+            non_english = []
+            detected_lang = "Unknown"
+            for folder in folders_to_check:
+                lang = NON_ENGLISH_HINTS.get(folder)
+                if lang and folder not in ENGLISH_FOLDERS:
+                    non_english.append(folder)
+                    detected_lang = lang
+
+            # A key signal: if "Account" is absent but something else looks like it
+            has_account = any("Account" in f or "account" in f.lower() for f in folders_to_check)
+            is_english = has_account or len(non_english) == 0
+            return is_english, detected_lang, non_english
+        except Exception:
+            return True, "", []   # can't detect → assume OK
+
+    def _show_language_warning(self, detected_lang: str, non_english_folders: list):
+        """Show a modal warning when a non-English package is detected."""
+        ctk = self.ctk
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("⚠️ Non-English Package Detected")
+        self._setup_popup(dlg, 620, 480)
+
+        # red accent bar
+        ctk.CTkFrame(dlg, fg_color="#cc2222", height=7, corner_radius=0).pack(fill="x")
+
+        ctk.CTkLabel(
+            dlg, text="🌐",
+            font=ctk.CTkFont(size=52),
+            anchor="center"
+        ).pack(pady=(24, 6))
+
+        ctk.CTkLabel(
+            dlg,
+            text="Non-English Package Detected!",
+            font=ctk.CTkFont(size=21, weight="bold"),
+            text_color="#ff6666",
+            justify="center", anchor="center"
+        ).pack(padx=30)
+
+        lang_str = f"  Detected language:  {detected_lang}  " if detected_lang and detected_lang != "Unknown" else ""
+        if lang_str:
+            ctk.CTkLabel(
+                dlg, text=lang_str,
+                font=ctk.CTkFont(size=13),
+                text_color="#ffaa44",
+                justify="center", anchor="center"
+            ).pack(pady=(6, 0))
+
+        ctk.CTkFrame(dlg, fg_color="#553333", height=2, corner_radius=0).pack(fill="x", padx=40, pady=(12, 16))
+
+        folders_sample = ", ".join(f'"{f}"' for f in non_english_folders[:5])
+        body = (
+            f"The selected ZIP appears to be a Discord package\n"
+            f"in a non-English language.\n\n"
+            f"Non-English folder names found inside the ZIP:\n"
+            f"  {folders_sample}\n\n"
+            f"For example, instead of  \"Account\"  the package uses a\n"
+            f"translated name. This tool requires English folder names.\n\n"
+            f"To fix: change Discord's language to  English,  request\n"
+            f"your data again, and open the new ZIP."
+        )
+        ctk.CTkLabel(
+            dlg, text=body,
+            font=ctk.CTkFont(size=13),
+            text_color="#ccbbbb",
+            justify="center", anchor="center"
+        ).pack(padx=36, pady=(0, 20), fill="x")
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.pack(pady=(0, 28))
+
+        _proceed = [False]
+        def _on_proceed():
+            _proceed[0] = True
+            self._close_popup(dlg)
+
+        ctk.CTkButton(
+            btn_row, text="✕  Cancel — Choose Another File",
+            width=230, height=42,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#cc2222", hover_color="#991111",
+            text_color="#ffffff", corner_radius=10,
+            command=lambda: self._close_popup(dlg)
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkButton(
+            btn_row, text="⚠️  Proceed Anyway",
+            width=180, height=42,
+            font=ctk.CTkFont(size=13),
+            fg_color="#555533", hover_color="#777744",
+            text_color="#ffdd88", corner_radius=10,
+            command=_on_proceed
+        ).pack(side="left")
+
+        dlg.bind("<Escape>", lambda e: self._close_popup(dlg))
+        dlg.after(80, dlg.focus_force)
+        dlg.wait_window()
+        return _proceed[0]
+
+    def _browse_zip(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select your Discord data package ZIP",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")])
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            self._show_error(
+                "Wrong File Type",
+                f"The file you selected is not a ZIP archive:\n"
+                f"  {Path(path).name}\n\n"
+                f"Please select your Discord data package\n"
+                f"which must be a  .zip  file.\n\n"
+                f"Download it from Discord:\n"
+                f"Settings → Privacy & Safety → Request Data"
+            )
+            return
+        # ── Language detection ──
+        is_english, detected_lang, non_english_folders = self._detect_package_language(path)
+        if not is_english and non_english_folders:
+            proceed = self._show_language_warning(detected_lang, non_english_folders)
+            if not proceed:
+                return   # user chose to cancel
+        self._set_path(path)
 
     def _start_generation(self):
         import threading
+        from tkinter import filedialog
+
+        # ── Ask where to save the HTML ──
+        save_path = filedialog.asksaveasfilename(
+            title="Save discord_viewer.html",
+            defaultextension=".html",
+            initialfile=f"discord_viewer.html",
+            filetypes=[("HTML file", "*.html"), ("All files", "*.*")],
+            initialdir=str(Path(self.selected_path).parent)
+        )
+        if not save_path:   # user cancelled
+            return
+
+        self._save_path = save_path
+
         self.gen_btn.configure(state="disabled")
         self.browse_btn.configure(state="disabled")
         self.open_btn.configure(state="disabled")
         # clear log
         self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
+        self.log_text.delete("0.0", "end")
         self.log_text.configure(state="disabled")
+        # show progress bar now (hidden at startup)
+        if not self._progress_visible:
+            self.progress.pack(fill="x", pady=(0, 4), before=self.status_label)
+            self._progress_visible = True
+        # reset to blurple for fresh run
+        self.progress.configure(mode="indeterminate",
+                                progress_color=_BLURPLE, fg_color="#2a2a40")
+        self.status_var.set("Starting…")
+        self.progress.start()
         # redirect stdout / logging → text widget
         self._setup_redirects()
         threading.Thread(target=self._run_thread, daemon=True).start()
 
+
     def _run_thread(self):
         try:
-            run_generation(self.selected_path)
-            self.output_path = OUTPUT_FILE
+            run_generation(self.selected_path, self._save_path)
+            self.output_path = Path(self._save_path)
             self.root.after(0, self._on_success)
         except Exception as e:
             self.root.after(0, self._on_error, str(e))
@@ -5332,13 +5873,30 @@ class DiscordViewerGUI:
             self.root.after(0, self._restore_redirects)
 
     def _on_success(self):
+        self.progress.stop()
+        self.progress.configure(mode="determinate",
+                                progress_color="#55ff99",
+                                fg_color="#1a3a1a")
+        self.progress.set(1.0)
         sz = self.output_path.stat().st_size / 1024 / 1024
+        self.status_var.set(f"✔  Complete!  {sz:.1f} MB  →  {self.output_path.name}")
+        self._zip_sub_lbl.configure(
+            text=f"✅  HTML saved: {self.output_path.name}  ({sz:.1f} MB)",
+            text_color="#55ff99"
+        )
+        self._zip_card.configure(border_color="#33aa66")
         self._log_tag(f"\n✔  Done!  {sz:.1f} MB → {self.output_path}\n", "success")
         self.gen_btn.configure(state="normal")
         self.browse_btn.configure(state="normal")
         self.open_btn.configure(state="normal")
 
     def _on_error(self, msg):
+        self.progress.stop()
+        self.progress.configure(mode="determinate",
+                                progress_color="#ff5555",
+                                fg_color="#3a1a1a")
+        self.progress.set(1.0)
+        self.status_var.set("✘  Error")
         self._log_tag(f"\n✘  ERROR: {msg}\n", "error")
         self.gen_btn.configure(state="normal")
         self.browse_btn.configure(state="normal")
@@ -5346,7 +5904,7 @@ class DiscordViewerGUI:
     def _log_tag(self, text, tag):
         try:
             self.log_text.configure(state="normal")
-            self.log_text.insert("end", text, (tag,))
+            self.log_text.insert("end", text, tag)
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
         except Exception:
@@ -5361,7 +5919,9 @@ class DiscordViewerGUI:
     def _setup_redirects(self):
         self._old_stdout = sys.stdout
         self._old_stderr = sys.stderr
-        sys.stdout = TextRedirector(self.log_text, self._old_stdout, "stdout")
+        sys.stdout = TextRedirector(self.log_text, self._old_stdout, "stdout",
+                                    status_var=self.status_var,
+                                    progress_ref=(self.progress, self.root))
         sys.stderr = TextRedirector(self.log_text, self._old_stderr, "error")
         self._log_handler = TextWidgetLogHandler(self.log_text)
         self._log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
@@ -5377,6 +5937,15 @@ class DiscordViewerGUI:
 
     # ── mainloop ──────────────────────────────────────────
     def run(self):
+        # CustomTkinter uses DPI scaling — must account for it when positioning.
+        # This is the official approach from the CTk author (_get_window_scaling).
+        w, h = 720, 560
+        scale = self.root._get_window_scaling()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = int(((sw / 2) - (w / 2)) * scale)
+        y = int(((sh / 2) - (h / 2)) * scale)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.mainloop()
         self._restore_redirects()
 
@@ -5392,7 +5961,15 @@ if __name__ == "__main__":
             sys.exit(1)
     else:
         # GUI mode:  double-click or run without arguments
-        import tkinter as tk
-        app = DiscordViewerGUI(tk)
+        try:
+            import customtkinter as ctk
+        except ImportError:
+            print("Installing customtkinter…")
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "customtkinter"])
+            import customtkinter as ctk
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+        app = DiscordViewerGUI(ctk)
         app.run()
 
