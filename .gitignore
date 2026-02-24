@@ -1,3 +1,4 @@
 /python-creator/build
 /.claude
 /__pycache__
+*.exe
