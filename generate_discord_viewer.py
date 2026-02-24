@@ -789,7 +789,14 @@ def generate_html(user, servers_idx, channels, stats, activity, avatar_b64, extr
         "NITRO_HISTORY": extra["nitro_history"],
         "PAYMENTS":      extra["payments"],
         "ORBS_BALANCE":  extra["orbs_balance"],
-        "USER_MAP":      extra.get("user_map", {}),
+        "USER_MAP":        extra.get("user_map", {}),
+        "SERVER_ICONS":    extra.get("server_icons", {}),
+        "SERVER_CHANNELS": extra.get("server_channels", {}),
+        "SERVER_WEBHOOKS": extra.get("server_webhooks", {}),
+        "HARVEST_HISTORY": extra.get("harvest_history", []),
+        "AD_TRAITS":       extra.get("ad_traits", {}),
+        "SUPPORT_TICKETS": extra.get("support_tickets", {}),
+        "DEV_APPS":        extra.get("dev_apps", []),
     }
 
     def jd(v):
@@ -876,6 +883,7 @@ html,body{{
   font-family:var(--font);
   background:var(--bg0);
   color:var(--text);font-size:17px;line-height:1.4;
+  user-select:none;-webkit-user-select:none;
 }}
 
 /* Global deep-space mesh background */
@@ -942,17 +950,37 @@ pre {{
 /* ── RAIL ─────────────────────────────────── */
 #rail{{
   width:84px;min-width:84px;
-  background:rgba(4,5,16,0.75);
-  backdrop-filter:blur(48px) saturate(1.4);
-  -webkit-backdrop-filter:blur(48px) saturate(1.4);
+  /* background & backdrop-filter moved to ::before so child animations
+     do NOT invalidate the blur composite layer → fixes gradient shadow flicker */
+  background:transparent;
   border-right:1px solid rgba(255,255,255,0.06);
   display:flex;flex-direction:column;align-items:center;
   padding:12px 0;gap:4px;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;
   box-shadow:2px 0 40px rgba(0,0,0,0.6);
   position:relative;z-index:10;
+  isolation:isolate;
+}}
+#rail::before{{
+  content:'';
+  position:fixed;
+  top:0;left:0;
+  width:84px;height:100vh;
+  background:rgba(4,5,16,0.75);
+  backdrop-filter:blur(48px) saturate(1.4);
+  -webkit-backdrop-filter:blur(48px) saturate(1.4);
+  z-index:-1;
+  pointer-events:none;
 }}
 #rail::-webkit-scrollbar{{display:none}}
 
+/* rail-wrap: positioning context for the pill OUTSIDE overflow:hidden */
+.rail-wrap{{
+  position:relative;
+  flex-shrink:0;
+  margin-bottom:4px;
+  display:flex;
+  align-items:center;
+}}
 .rail-icon{{
   position:relative;width:54px;height:54px;
   border-radius:50%;cursor:pointer;
@@ -964,7 +992,9 @@ pre {{
              background .18s ease,
              box-shadow .18s ease,
              transform .12s ease;
-  flex-shrink:0;overflow:hidden;user-select:none;
+  flex-shrink:0;
+  overflow:hidden;
+  user-select:none;
   border-top:1px solid rgba(255,255,255,0.13);
   border-left:1px solid rgba(255,255,255,0.08);
   border-bottom:1px solid rgba(0,0,0,0.5);
@@ -972,11 +1002,15 @@ pre {{
   box-shadow:0 4px 20px rgba(0,0,0,0.5),
              inset 0 1px 0 rgba(255,255,255,0.10),
              inset 0 -1px 0 rgba(0,0,0,0.2);
-  margin-bottom:4px;
-  backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);
+  /* translateZ(0): forces own GPU composite layer from the start
+     → eliminates layer-promotion flicker on hover/active transitions */
+  transform:translateZ(0);
+  will-change:border-radius, box-shadow;
+  /* backdrop-filter REMOVED: it forces a new stacking context on every
+     transition frame in Chrome/Windows → the gradient shadow flicker.
+     The icons have solid bg when active so it's not needed visually. */
 }}
-.rail-icon:hover,.rail-icon.active{{border-radius:35%;transform:scale(1.04)}}
+.rail-icon:hover,.rail-icon.active{{border-radius:35%;transform:translateZ(0) scale(1.04)}}
 .rail-icon.active{{
   background:var(--srv-color,hsl(230,60%,42%)) !important;
   color:#fff;
@@ -994,6 +1028,8 @@ pre {{
              inset 0 1px 0 rgba(255,255,255,0.15);
 }}
 
+/* pill lives in .rail-wrap (sibling of .rail-icon, outside overflow:hidden)
+   so its gradient shadow never interacts with the icon's clip region */
 .rail-pill{{
   position:absolute;left:-4px;top:50%;transform:translateY(-50%);
   width:4px;
@@ -1003,9 +1039,10 @@ pre {{
   height:0;
   transition:height .22s cubic-bezier(.55,0,.1,1);
   pointer-events:none;
+  z-index:10;
 }}
-.rail-icon.active .rail-pill{{height:40px}}
-.rail-icon:hover:not(.active) .rail-pill{{height:20px}}
+.rail-wrap.active .rail-pill{{height:40px}}
+.rail-wrap:hover .rail-pill{{height:20px}}
 .rail-sep{{width:30px;height:1px;background:rgba(255,255,255,0.07);border-radius:1px;margin:4px 0;flex-shrink:0}}
 
 /* rail tooltip */
@@ -1967,6 +2004,14 @@ mark.hl.cur{{
 .msg-content{{
   font-size:16px;line-height:1.48;color:var(--text);
   word-break:break-word;white-space:pre-wrap;
+  user-select:text;-webkit-user-select:text;
+}}
+/* custom selection — blurple glow, matches Discord aesthetic */
+.msg-content ::selection,
+.msg-content::selection{{
+  background:rgba(88,101,242,0.45);
+  color:#fff;
+  text-shadow:0 0 12px rgba(88,101,242,0.7);
 }}
 
 /* ── ATTACHMENTS ─────────────────────────── */
@@ -1986,6 +2031,34 @@ mark.hl.cur{{
   transform:scale(1.005);
 }}
 .att-img img{{display:block;max-width:100%;max-height:400px;object-fit:contain}}
+
+/* ── EXPIRED / 404 ATTACHMENT PLACEHOLDER ── */
+.att-expired-ph{{
+  display:inline-flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:5px;
+  padding:18px 28px;min-width:150px;
+  border-radius:var(--r2);
+  background:rgba(255,255,255,0.03);
+  border:1px dashed rgba(255,255,255,0.14);
+  color:var(--muted);text-decoration:none;
+  cursor:pointer;transition:background .14s,border-color .14s,color .14s;
+  text-align:center;
+}}
+.att-expired-ph:hover{{
+  background:rgba(255,255,255,0.07);
+  border-color:rgba(255,255,255,0.26);
+  color:var(--text2);
+  text-decoration:none;
+}}
+.att-exp-ico{{font-size:26px;line-height:1;opacity:.55}}
+.att-exp-name{{
+  font-size:11px;font-family:var(--mono);color:var(--text2);
+  max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}}
+.att-exp-lbl{{
+  font-size:10px;font-family:var(--mono);
+  color:var(--muted);letter-spacing:.04em;
+}}
 
 .att-file{{
   display:inline-flex;align-items:center;gap:10px;margin-top:6px;
@@ -2121,6 +2194,7 @@ mark.hl.cur{{
   border-right:1px solid rgba(0,0,0,0.32);
   cursor:default;position:relative;
   box-shadow:0 4px 20px rgba(0,0,0,0.5);
+  user-select:none;-webkit-user-select:none;
 }}
 .att-tenor iframe{{display:block;width:420px;max-width:100%;height:280px;border:0;pointer-events:none}}
 .att-tenor-thumb{{
@@ -2229,27 +2303,73 @@ mark.hl.cur{{
 /* context menu */
 #ctx-menu{{
   position:fixed;z-index:9998;
-  background:rgba(10,12,26,0.95);
-  backdrop-filter:blur(28px) saturate(1.3);
-  -webkit-backdrop-filter:blur(28px) saturate(1.3);
+  background:rgba(10,12,26,0.96);
+  backdrop-filter:blur(32px) saturate(1.4);
+  -webkit-backdrop-filter:blur(32px) saturate(1.4);
   border-top:1px solid rgba(255,255,255,0.14);
   border-left:1px solid rgba(255,255,255,0.09);
   border-bottom:1px solid rgba(0,0,0,0.55);
   border-right:1px solid rgba(0,0,0,0.35);
-  border-radius:var(--r2);padding:4px 0;min-width:180px;
-  box-shadow:0 12px 48px rgba(0,0,0,0.70),
-             inset 0 1px 0 rgba(255,255,255,0.08);
+  border-radius:12px;padding:6px;min-width:210px;
+  box-shadow:0 20px 60px rgba(0,0,0,0.75),
+             0 4px 16px rgba(0,0,0,0.5),
+             inset 0 1px 0 rgba(255,255,255,0.10);
   display:none;user-select:none;
 }}
 #ctx-menu.open{{display:block}}
 .ctx-item{{
-  padding:8px 16px;font-size:13px;font-weight:500;color:var(--text2);
-  cursor:pointer;display:flex;align-items:center;gap:10px;
-  transition:background .08s,color .08s;
+  padding:10px 14px;font-size:13px;font-weight:500;color:var(--text2);
+  cursor:pointer;display:flex;align-items:center;gap:12px;
+  position:relative;overflow:hidden;
+  border-radius:8px;
+  transition:color .15s ease;
 }}
-.ctx-item:hover{{background:rgba(88,101,242,0.25);color:#fff}}
-.ctx-item .ctx-ico{{font-size:14px;flex-shrink:0;width:18px;text-align:center}}
-.ctx-sep{{height:1px;background:rgba(255,255,255,0.06);margin:3px 0}}
+/* sliding gradient fill on hover */
+.ctx-item::before{{
+  content:'';
+  position:absolute;inset:0;
+  background:linear-gradient(90deg,
+    rgba(88,101,242,0.0) 0%,
+    rgba(88,101,242,0.22) 50%,
+    rgba(114,137,218,0.14) 100%);
+  transform:translateX(-100%);
+  transition:transform .20s cubic-bezier(.4,0,.2,1);
+  border-radius:inherit;
+}}
+/* left accent bar */
+.ctx-item::after{{
+  content:'';
+  position:absolute;left:0;top:18%;height:64%;
+  width:3px;
+  background:linear-gradient(to bottom, #a5b4fc, #5865f2);
+  border-radius:0 3px 3px 0;
+  box-shadow:0 0 10px rgba(88,101,242,0.9);
+  transform:scaleY(0);
+  transition:transform .16s cubic-bezier(.4,0,.2,1);
+  transform-origin:center;
+}}
+.ctx-item:hover{{
+  color:#fff;
+}}
+.ctx-item:hover::before{{
+  transform:translateX(0);
+}}
+.ctx-item:hover::after{{
+  transform:scaleY(1);
+}}
+.ctx-item:hover .ctx-ico{{
+  transform:scale(1.18) rotate(-4deg);
+  filter:drop-shadow(0 0 5px rgba(140,150,255,0.75));
+}}
+.ctx-item .ctx-ico{{
+  font-size:15px;flex-shrink:0;width:20px;text-align:center;
+  transition:transform .18s cubic-bezier(.4,0,.2,1), filter .18s ease;
+}}
+.ctx-sep{{
+  height:1px;
+  background:linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+  margin:4px 6px;
+}}
 
 /* ── LIGHTBOX ──────────────────────────────── */
 #lb{{
@@ -2808,16 +2928,339 @@ mark.hl.cur{{
 
 /* last section padding */
 .sec.last{{padding-bottom:32px}}
+
+/* ── SERVER ICONS (rail + detail modal) ─────── */
+.srv-icon-img{{width:40px;height:40px;border-radius:50%;object-fit:cover;flex-shrink:0;border:1px solid rgba(255,255,255,0.12)}}
+.srv-icon-placeholder{{
+  width:40px;height:40px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  font-size:16px;font-weight:800;color:#fff;
+}}
+
+/* ── SERVER DETAIL MODAL ──────────────────── */
+#srv-detail-modal{{
+  position:fixed;inset:0;z-index:500;
+  background:rgba(0,0,0,0.72);
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  display:flex;align-items:center;justify-content:center;
+  padding:24px;
+}}
+.srvd-panel{{
+  width:100%;max-width:600px;max-height:80vh;
+  background:rgba(10,12,28,0.96);
+  backdrop-filter:blur(40px);-webkit-backdrop-filter:blur(40px);
+  border-top:1px solid rgba(255,255,255,0.14);
+  border-left:1px solid rgba(255,255,255,0.09);
+  border-bottom:1px solid rgba(0,0,0,0.6);
+  border-right:1px solid rgba(0,0,0,0.4);
+  border-radius:var(--r3);
+  box-shadow:0 24px 80px rgba(0,0,0,0.8),0 0 0 1px rgba(255,255,255,0.06),inset 0 1px 0 rgba(255,255,255,0.10);
+  display:flex;flex-direction:column;overflow:hidden;
+}}
+.srvd-header{{
+  display:flex;align-items:center;gap:14px;padding:18px 20px 14px;
+  border-bottom:1px solid rgba(255,255,255,0.07);flex-shrink:0;
+}}
+.srvd-icon-wrap{{flex-shrink:0}}
+.srvd-info{{flex:1;min-width:0}}
+.srvd-name{{font-size:17px;font-weight:800;color:#fff}}
+.srvd-meta{{font-size:12px;color:var(--muted);margin-top:2px;font-family:var(--mono)}}
+.srvd-close{{
+  background:none;border:none;color:var(--muted);font-size:18px;
+  padding:4px 8px;border-radius:var(--r);cursor:pointer;
+  transition:color .12s,background .12s;
+}}
+.srvd-close:hover{{color:#fff;background:rgba(255,255,255,0.08)}}
+.srvd-body{{overflow-y:auto;padding:14px 20px 20px;flex:1}}
+.srvd-sub-title{{
+  font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);display:flex;align-items:center;gap:6px;
+  padding:6px 0 8px;border-bottom:1px solid rgba(255,255,255,0.06);margin-bottom:8px;
+}}
+
+/* channels list in srv-detail */
+.srvd-cat{{
+  font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--muted);padding:10px 0 4px;
+}}
+.srvd-ch-row{{
+  display:flex;align-items:center;gap:6px;padding:4px 6px 4px 18px;
+  border-radius:var(--r);font-size:13px;color:var(--text2);
+  transition:background .10s;
+}}
+.srvd-ch-row:hover{{background:rgba(255,255,255,0.05)}}
+.srvd-ch-ico{{font-size:14px;flex-shrink:0;width:18px;text-align:center}}
+.srvd-ch-name{{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.srvd-ch-badge{{
+  font-size:10px;font-family:var(--mono);
+  background:rgba(88,101,242,0.18);color:var(--blurple);
+  border:1px solid rgba(88,101,242,0.25);
+  border-radius:10px;padding:0 6px;flex-shrink:0;
+}}
+
+/* webhooks list in srv-detail */
+.srvd-wh-row{{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 10px;border-radius:var(--r2);margin-bottom:6px;
+  background:rgba(255,255,255,0.04);
+  border:1px solid rgba(255,255,255,0.06);
+  transition:background .10s;
+}}
+.srvd-wh-row:hover{{background:rgba(255,255,255,0.07)}}
+.srvd-wh-av{{width:32px;height:32px;border-radius:50%;object-fit:cover;flex-shrink:0;background:rgba(255,255,255,0.1)}}
+.srvd-wh-av-ph{{width:32px;height:32px;border-radius:50%;flex-shrink:0;background:rgba(88,101,242,0.25);display:flex;align-items:center;justify-content:center;font-size:14px}}
+.srvd-wh-info{{flex:1;min-width:0}}
+.srvd-wh-name{{font-size:13px;font-weight:600;color:var(--text)}}
+.srvd-wh-type{{font-size:10px;font-family:var(--mono);color:var(--muted)}}
+.srvd-wh-ch{{font-size:11px;color:var(--faint)}}
+/* allow taller channel lists in the server detail */
+.srvd-body .collapsible-body.open{{max-height:600px;overflow-y:auto}}
+
+/* ── HARVEST HISTORY ──────────────────────── */
+.harvest-summary{{
+  font-size:13px;color:var(--text2);margin-bottom:12px;
+  background:rgba(88,101,242,0.10);border-left:3px solid var(--accent);
+  border-radius:0 var(--r) var(--r) 0;padding:8px 12px;
+}}
+.harvest-timeline{{position:relative;padding-left:22px}}
+.harvest-timeline::before{{
+  content:'';position:absolute;left:8px;top:0;bottom:0;width:2px;
+  background:linear-gradient(180deg,var(--accent),transparent);border-radius:2px;
+}}
+.harvest-entry{{
+  position:relative;margin-bottom:10px;
+  display:flex;align-items:center;gap:12px;
+  background:rgba(255,255,255,0.04);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-top:1px solid rgba(255,255,255,0.10);
+  border-left:1px solid rgba(255,255,255,0.06);
+  border-bottom:1px solid rgba(0,0,0,0.40);
+  border-right:1px solid rgba(0,0,0,0.22);
+  border-radius:var(--r2);padding:8px 14px;
+  box-shadow:0 2px 12px rgba(0,0,0,0.36);
+}}
+.harvest-entry::before{{
+  content:'';position:absolute;left:-17px;top:50%;transform:translateY(-50%);
+  width:10px;height:10px;border-radius:50%;
+  background:var(--accent);border:2px solid var(--bg0);
+  box-shadow:0 0 8px rgba(88,101,242,0.6);
+}}
+.harvest-date{{font-size:12px;font-family:var(--mono);color:var(--text2);font-weight:600}}
+.harvest-email{{font-size:11px;font-family:var(--mono);color:var(--muted)}}
+
+/* ── AD PROFILE ───────────────────────────── */
+.adprofile-banner{{
+  font-size:12px;color:#c9a227;
+  background:rgba(240,178,50,0.08);
+  border-left:3px solid #f0b232;
+  border-radius:0 var(--r) var(--r) 0;
+  padding:8px 12px;margin-bottom:14px;line-height:1.5;
+}}
+.adprofile-card{{
+  background:rgba(255,255,255,0.05);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border-top:1px solid rgba(255,255,255,0.12);
+  border-left:1px solid rgba(255,255,255,0.07);
+  border-bottom:1px solid rgba(0,0,0,0.44);
+  border-right:1px solid rgba(0,0,0,0.26);
+  border-radius:var(--r2);padding:14px 18px;
+  box-shadow:0 3px 16px rgba(0,0,0,0.42),inset 0 1px 0 rgba(255,255,255,0.07);
+}}
+.adp-row{{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);align-items:flex-start;flex-wrap:wrap}}
+.adp-row:last-child{{border-bottom:none}}
+.adp-key{{font-size:11px;font-family:var(--mono);color:var(--muted);flex-shrink:0;width:160px;padding-top:2px}}
+.adp-val{{font-size:13px;font-weight:600;color:var(--text);flex:1}}
+.adp-theme-wrap{{display:flex;flex-wrap:wrap;gap:5px;margin-top:4px}}
+.adp-theme{{
+  font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  background:rgba(88,101,242,0.16);color:#b5bcf0;
+  border:1px solid rgba(88,101,242,0.28);border-radius:20px;
+  padding:2px 10px;
+}}
+
+/* ── SUPPORT TICKETS ──────────────────────── */
+.tickets-summary{{
+  font-size:13px;color:var(--text2);
+  background:rgba(255,255,255,0.04);border-left:3px solid var(--accent);
+  border-radius:0 var(--r) var(--r) 0;padding:8px 12px;
+}}
+.ticket-card{{margin-bottom:8px;border-radius:var(--r2);overflow:hidden;border:1px solid rgba(255,255,255,0.07)}}
+.ticket-hdr{{
+  display:flex;align-items:center;gap:10px;padding:10px 14px;
+  background:rgba(255,255,255,0.05);cursor:pointer;
+  transition:background .12s;
+}}
+.ticket-hdr:hover{{background:rgba(255,255,255,0.09)}}
+.ticket-date{{font-size:11px;font-family:var(--mono);color:var(--muted);flex-shrink:0}}
+.ticket-status{{
+  font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  border-radius:10px;padding:1px 8px;flex-shrink:0;font-family:var(--mono);
+}}
+.ticket-status.closed{{background:rgba(35,165,89,0.18);color:#7ee8a2;border:1px solid rgba(35,165,89,0.28)}}
+.ticket-status.deleted{{background:rgba(255,255,255,0.08);color:var(--muted);border:1px solid rgba(255,255,255,0.12)}}
+.ticket-status.open{{background:rgba(240,178,50,0.18);color:#f0b232;border:1px solid rgba(240,178,50,0.28)}}
+.ticket-subject{{flex:1;font-size:13px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.ticket-body{{
+  background:rgba(0,0,0,0.25);padding:12px 14px;
+  display:none;flex-direction:column;gap:8px;
+}}
+.ticket-body.open{{display:flex}}
+.ticket-bubble{{
+  max-width:80%;border-radius:var(--r2);padding:8px 12px;
+  font-size:13px;line-height:1.45;word-break:break-word;
+}}
+.ticket-bubble.user{{
+  align-self:flex-end;
+  background:rgba(88,101,242,0.35);
+  border-top:1px solid rgba(88,101,242,0.5);
+  border-left:1px solid rgba(88,101,242,0.3);
+  border-bottom:1px solid rgba(0,0,0,0.4);
+  border-right:1px solid rgba(0,0,0,0.25);
+  color:#d0d5ff;
+}}
+.ticket-bubble.agent{{
+  align-self:flex-start;
+  background:rgba(255,255,255,0.07);
+  border:1px solid rgba(255,255,255,0.08);
+  color:var(--text2);
+}}
+.ticket-bubble-meta{{font-size:10px;color:var(--muted);margin-bottom:3px;font-family:var(--mono)}}
+
+/* ── DEVELOPER APPS BADGE ─────────────────── */
+.hbadge.hb-devapp{{
+  background:rgba(99,102,241,0.18);
+  border-top:1px solid rgba(129,140,248,0.30);
+  border-left:1px solid rgba(99,102,241,0.18);
+  border-bottom:1px solid rgba(0,0,0,0.4);
+  border-right:1px solid rgba(0,0,0,0.25);
+  position:relative;
+  overflow:visible;
+}}
+.hbadge.hb-devapp .badge-label{{color:#c7d2fe}}
+.hbadge.hb-devapp .badge-value{{color:#818cf8}}
+.devapp-tooltip{{
+  display:none;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);
+  background:rgba(8,10,22,0.97);
+  backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
+  border:1px solid rgba(255,255,255,0.12);border-radius:var(--r2);
+  padding:8px 12px;z-index:400;min-width:200px;
+  box-shadow:0 12px 40px rgba(0,0,0,0.7);
+  font-size:11px;line-height:1.6;color:var(--text2);
+  white-space:nowrap;
+}}
+.hbadge.hb-devapp:hover .devapp-tooltip{{display:block}}
+.devapp-tip-row{{display:flex;align-items:center;gap:6px}}
+.devapp-tip-bot{{
+  font-size:9px;font-family:var(--mono);
+  background:rgba(88,101,242,0.20);color:#9ca3f5;
+  border-radius:4px;padding:0 5px;
+}}
+/* ── LOADING SCREEN ──────────────────────────────────────────── */
+#loading-screen{{
+  position:fixed;inset:0;z-index:99999;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  background:radial-gradient(ellipse 80% 80% at 50% 40%,
+    rgba(88,101,242,0.13) 0%,
+    rgba(4,5,16,1) 65%),
+    #04050F;
+  transition:opacity .5s ease, visibility .5s ease;
+  gap:28px;
+}}
+#loading-screen.done{{
+  opacity:0;visibility:hidden;pointer-events:none;
+}}
+/* orbiting rings */
+.ld-rings{{
+  position:relative;width:90px;height:90px;
+}}
+.ld-ring{{
+  position:absolute;inset:0;border-radius:50%;
+  border:2px solid transparent;
+}}
+.ld-ring-1{{
+  border-top-color:rgba(88,101,242,0.9);
+  border-right-color:rgba(88,101,242,0.3);
+  animation:ld-spin1 1.1s linear infinite;
+}}
+.ld-ring-2{{
+  inset:10px;
+  border-top-color:transparent;
+  border-bottom-color:rgba(114,137,218,0.7);
+  border-left-color:rgba(114,137,218,0.2);
+  animation:ld-spin2 .8s linear infinite;
+}}
+.ld-ring-3{{
+  inset:22px;
+  border-right-color:rgba(160,170,255,0.6);
+  border-top-color:transparent;
+  animation:ld-spin1 .6s linear infinite reverse;
+}}
+.ld-dot{{
+  position:absolute;inset:38px;border-radius:50%;
+  background:radial-gradient(circle, rgba(140,150,255,1) 0%, rgba(88,101,242,0.6) 60%, transparent 100%);
+  box-shadow:0 0 18px rgba(88,101,242,0.9), 0 0 40px rgba(88,101,242,0.4);
+  animation:ld-pulse .9s ease-in-out infinite alternate;
+}}
+@keyframes ld-spin1{{ to{{transform:rotate(360deg)}} }}
+@keyframes ld-spin2{{ to{{transform:rotate(-360deg)}} }}
+@keyframes ld-pulse{{
+  from{{transform:scale(.85);opacity:.7}}
+  to{{transform:scale(1.1);opacity:1}}
+}}
+/* text */
+.ld-title{{
+  font-size:18px;font-weight:700;color:#fff;letter-spacing:.04em;
+  text-shadow:0 0 24px rgba(88,101,242,0.7);
+}}
+.ld-sub{{
+  font-size:12px;font-weight:500;color:rgba(160,170,255,0.7);
+  letter-spacing:.12em;text-transform:uppercase;
+  margin-top:-20px;
+}}
+/* animated progress bar */
+.ld-bar-wrap{{
+  width:200px;height:2px;
+  background:rgba(255,255,255,0.07);
+  border-radius:2px;overflow:hidden;
+}}
+.ld-bar{{
+  height:100%;width:0%;
+  background:linear-gradient(90deg, #5865f2, #a5b4fc);
+  box-shadow:0 0 8px rgba(88,101,242,0.8);
+  border-radius:2px;
+  transition:width .3s ease;
+  animation:ld-bar-fill 1.6s cubic-bezier(.4,0,.2,1) forwards;
+}}
+@keyframes ld-bar-fill{{
+  0%{{width:0%}}
+  60%{{width:75%}}
+  85%{{width:90%}}
+  100%{{width:100%}}
+}}
 </style>
 </head>
 <body>
+<!-- LOADING SCREEN -->
+<div id="loading-screen">
+  <div class="ld-rings">
+    <div class="ld-ring ld-ring-1"></div>
+    <div class="ld-ring ld-ring-2"></div>
+    <div class="ld-ring ld-ring-3"></div>
+    <div class="ld-dot"></div>
+  </div>
+  <div class="ld-title">Discord Viewer</div>
+  <div class="ld-sub">Loading your data...</div>
+  <div class="ld-bar-wrap"><div class="ld-bar"></div></div>
+</div>
 <div id="app">
 
 <!-- RAIL -->
 <div id="rail">
-  <div class="rail-icon active" id="rail-home" data-tip="Home" onclick="showHome(this)">
+  <div class="rail-wrap active" id="rail-home-wrap">
     <div class="rail-pill"></div>
-    🏠
+    <div class="rail-icon active" id="rail-home" data-tip="Home" onclick="showHome(this)">
+      🏠
+    </div>
   </div>
   <div class="rail-sep"></div>
   <div id="rail-srvs"></div>
@@ -2950,7 +3393,62 @@ mark.hl.cur{{
       </div>
     </div>
 
+    <!-- ── DATA REQUEST HISTORY ──────────────── -->
+    <div class="sec" id="sec-harvest" style="display:none">
+      <div class="sec-title" style="cursor:pointer" onclick="toggleCollapse('harvest-body','harvest-chevron')">📋 Data Request History<button class="collapse-btn" id="harvest-chevron">▼</button></div>
+      <div class="collapsible-body" id="harvest-body">
+        <div id="harvest-summary-el" style="margin-bottom:10px"></div>
+        <div class="harvest-timeline" id="harvest-el"></div>
+      </div>
+    </div>
 
+    <!-- ── AD PROFILE ───────────────────────── -->
+    <div class="sec" id="sec-adprofile" style="display:none">
+      <div class="sec-title" style="cursor:pointer" onclick="toggleCollapse('adprofile-body','adprofile-chevron')">🎯 Ad Profile<button class="collapse-btn" id="adprofile-chevron">▼</button></div>
+      <div class="collapsible-body" id="adprofile-body">
+        <div id="adprofile-el"></div>
+      </div>
+    </div>
+
+    <!-- ── SUPPORT TICKETS ──────────────────── -->
+    <div class="sec" id="sec-tickets" style="display:none">
+      <div class="sec-title" style="cursor:pointer" onclick="toggleCollapse('tickets-body','tickets-chevron')">🎫 Support Tickets<button class="collapse-btn" id="tickets-chevron">▼</button></div>
+      <div class="collapsible-body" id="tickets-body">
+        <div id="tickets-summary-el" style="margin-bottom:10px"></div>
+        <div id="tickets-el"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- SERVER DETAIL MODAL -->
+  <div id="srv-detail-modal" style="display:none">
+    <div class="srvd-panel">
+      <div class="srvd-header">
+        <div class="srvd-icon-wrap" id="srvd-icon-el"></div>
+        <div class="srvd-info">
+          <div class="srvd-name" id="srvd-name-el"></div>
+          <div class="srvd-meta" id="srvd-meta-el"></div>
+        </div>
+        <button class="srvd-close" onclick="closeSrvDetail()">✕</button>
+      </div>
+      <div class="srvd-body">
+        <!-- Channels subsection -->
+        <div id="srvd-ch-wrap">
+          <div class="srvd-sub-title" style="cursor:pointer" onclick="toggleCollapse('srvd-ch-body','srvd-ch-chev')"># Channels<button class="collapse-btn open" id="srvd-ch-chev">▼</button></div>
+          <div class="collapsible-body open" id="srvd-ch-body">
+            <div id="srvd-ch-el"></div>
+          </div>
+        </div>
+        <!-- Webhooks subsection -->
+        <div id="srvd-wh-wrap" style="display:none;margin-top:14px">
+          <div class="srvd-sub-title" style="cursor:pointer" onclick="toggleCollapse('srvd-wh-body','srvd-wh-chev')">🔗 Webhooks<button class="collapse-btn open" id="srvd-wh-chev">▼</button></div>
+          <div class="collapsible-body open" id="srvd-wh-body">
+            <div id="srvd-wh-el"></div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- CHANNEL HEADER -->
@@ -2986,16 +3484,16 @@ mark.hl.cur{{
     <div class="drp-bar">
       <div class="drp-field" id="drp-field-start" onclick="drpFocusField('start')">
         <span class="drp-field-ico">📅</span>
-        <span class="drp-field-val empty" id="drp-val-start">Από...</span>
+        <span class="drp-field-val empty" id="drp-val-start" data-i18n-ph-el="Από..." data-i18n-ph-en="From...">From...</span>
       </div>
       <span class="drp-sep">→</span>
       <div class="drp-field" id="drp-field-end" onclick="drpFocusField('end')">
         <span class="drp-field-ico">📅</span>
-        <span class="drp-field-val empty" id="drp-val-end">Έως...</span>
+        <span class="drp-field-val empty" id="drp-val-end" data-i18n-ph-el="Έως..." data-i18n-ph-en="To...">To...</span>
       </div>
       <div class="drp-bar-actions">
-        <button class="drp-clear" onclick="clearDateRange()">Καθαρισμός</button>
-        <button class="drp-apply" onclick="applyDateRange()">✓ Εφαρμογή</button>
+        <button class="drp-clear" onclick="clearDateRange()" data-i18n="dr-clear">Clear</button>
+        <button class="drp-apply" onclick="applyDateRange()" data-i18n="dr-apply">✓ Apply</button>
       </div>
     </div>
     <!-- Two calendars side by side -->
@@ -3005,12 +3503,12 @@ mark.hl.cur{{
     </div>
     <!-- Footer: shortcuts -->
     <div class="drp-footer">
-      <span class="drp-hint" id="drp-hint">Επιλέξτε αρχική ημερομηνία</span>
+      <span class="drp-hint" id="drp-hint" data-i18n-el="Επιλέξτε αρχική ημερομηνία" data-i18n-en="Select start date">Select start date</span>
       <div class="drp-shortcut-row">
-        <button class="drp-shortcut" onclick="drpShortcut(7)">Τελ. 7 μέρες</button>
-        <button class="drp-shortcut" onclick="drpShortcut(30)">Τελ. 30 μέρες</button>
-        <button class="drp-shortcut" onclick="drpShortcut(90)">Τελ. 90 μέρες</button>
-        <button class="drp-shortcut" onclick="drpShortcutYear()">5τος έτος</button>
+        <button class="drp-shortcut" onclick="drpShortcut(7)"  data-i18n-el="Τελ. 7 μέρες"  data-i18n-en="Last 7 days">Last 7 days</button>
+        <button class="drp-shortcut" onclick="drpShortcut(30)" data-i18n-el="Τελ. 30 μέρες" data-i18n-en="Last 30 days">Last 30 days</button>
+        <button class="drp-shortcut" onclick="drpShortcut(90)" data-i18n-el="Τελ. 90 μέρες" data-i18n-en="Last 90 days">Last 90 days</button>
+        <button class="drp-shortcut" onclick="drpShortcutYear()" data-i18n-el="5τος έτος" data-i18n-en="This year">This year</button>
       </div>
     </div>
   </div>
@@ -3058,7 +3556,14 @@ const QUESTS       = {jd(JS["QUESTS"])};
 const NITRO_HISTORY= {jd(JS["NITRO_HISTORY"])};
 const PAYMENTS     = {jd(JS["PAYMENTS"])};
 const ORBS_BALANCE = {jd(JS["ORBS_BALANCE"])};
-const USER_MAP     = {jd(JS["USER_MAP"])};
+const USER_MAP      = {jd(JS["USER_MAP"])};
+const SERVER_ICONS    = {jd(JS["SERVER_ICONS"])};
+const SERVER_CHANNELS = {jd(JS["SERVER_CHANNELS"])};
+const SERVER_WEBHOOKS = {jd(JS["SERVER_WEBHOOKS"])};
+const HARVEST_HISTORY = {jd(JS["HARVEST_HISTORY"])};
+const AD_TRAITS       = {jd(JS["AD_TRAITS"])};
+const SUPPORT_TICKETS = {jd(JS["SUPPORT_TICKETS"])};
+const DEV_APPS        = {jd(JS["DEV_APPS"])};
 let PER_PAGE  = 250;
 
 // ── SVG ICONS ──────────────────────────────────────────────
@@ -3210,6 +3715,13 @@ function buildHeroBadges() {{
 }}
 
 // ── TOP SERVERS ────────────────────────────────────────────
+// Build a server-name → guild_id lookup (used by both buildTopServers and buildRail)
+function _srvNameToSid() {{
+  const m = {{}};
+  Object.entries(SERVERS).forEach(([sid, name]) => {{ m[name] = sid; }});
+  return m;
+}}
+
 function buildTopServers() {{
   const g = document.getElementById('srv-grid-el');
   const maxV = STATS.top_servers[0]?.[1] || 1;
@@ -3217,14 +3729,27 @@ function buildTopServers() {{
   const right = document.createElement('div');
   left.className = right.className = 'srv-col';
 
+  const nameToSid = _srvNameToSid();
+
   STATS.top_servers.forEach(([name,cnt], i) => {{
-    const h   = srvColor(name);
-    const abbr= name.replace(/[^a-zA-ZΑ-Ωα-ω0-9 ]/g,'').trim();
-    const ini2= abbr.split(' ').map(w=>w[0]||'').join('').toUpperCase().slice(0,2) || '?';
-    const d   = document.createElement('div');
+    const h       = srvColor(name);
+    const abbr    = name.replace(/[^a-zA-ZΑ-Ωα-ω0-9 ]/g,'').trim();
+    const ini2    = abbr.split(' ').map(w=>w[0]||'').join('').toUpperCase().slice(0,2) || '?';
+    const sid     = nameToSid[name] || '';
+    const iconUrl = sid ? SERVER_ICONS[sid] : null;
+
+    const d = document.createElement('div');
     d.className = 'srv-card';
+
+    // Icon: real image if available, else colored letter abbreviation
+    const icoHtml = iconUrl
+      ? `<div class="srv-card-ico" style="background:${{hslGrad(h,1)}};padding:0;overflow:hidden">
+           <img src="${{iconUrl}}" style="width:46px;height:46px;object-fit:cover;border-radius:var(--r2);display:block" loading="lazy">
+         </div>`
+      : `<div class="srv-card-ico" style="background:${{hslGrad(h,1)}}">${{ini2}}</div>`;
+
     d.innerHTML = `
-      <div class="srv-card-ico" style="background:${{hslGrad(h,1)}}">${{ini2}}</div>
+      ${{icoHtml}}
       <div class="srv-card-info">
         <div class="srv-card-name">${{esc(name)}}</div>
         <div class="srv-card-msgs" data-cnt="${{cnt}}">${{fmt(cnt)}} ${{LANG==='el'?'μηνύματα':'messages'}}</div>
@@ -3331,31 +3856,72 @@ function buildRail() {{
   Object.entries(SERVERS).forEach(([sid, name]) => {{
     const count = srvMsgCount.get(name) || 0;
     if (count > 0) {{
-      serversWithMsgs.push({{ name, count }});
+      serversWithMsgs.push({{ sid, name, count }});
     }}
   }});
-  
+
   // Ταξινόμηση βάσει μηνυμάτων (φθίνουσα)
   serversWithMsgs.sort((a, b) => b.count - a.count);
-  
+
   // Δημιουργία rail icons
-  serversWithMsgs.forEach(({{ name, count }}) => {{
+  serversWithMsgs.forEach(({{ sid, name, count }}) => {{
     const h    = srvColor(name);
     const abbr = name.replace(/[^a-zA-ZΑ-Ωα-ω0-9 ]/g,'').trim();
     const ini2 = abbr.split(' ').map(w=>w[0]||'').join('').toUpperCase().slice(0,2)||'?';
+
+    // wrap: pill lives here (outside overflow:hidden) to prevent shadow flicker
+    const wrap = document.createElement('div');
+    wrap.className = 'rail-wrap';
+
+    const pill = document.createElement('div');
+    pill.className = 'rail-pill';
+    wrap.appendChild(pill);
+
     const el   = document.createElement('div');
     el.className = 'rail-icon';
-    el.setAttribute('data-tip', `${{name}} (${{fmt(count)}} ${{LANG==='el'?'μηνύματα':'messages'}})`); el.setAttribute('data-cnt', count); el.setAttribute('data-name', name);
+    el.setAttribute('data-tip', `${{name}} (${{fmt(count)}} ${{LANG==='el'?'μηνύματα':'messages'}})`);
+    el.setAttribute('data-cnt', count);
+    el.setAttribute('data-name', name);
+    el.setAttribute('data-sid', sid);
     el.style.cssText = `--srv-color:hsl(${{h}},60%,42%);--srv-glow:hsla(${{h}},65%,52%,0.52);background:#111214;color:#fff;font-size:14px`;
-    el.innerHTML = `<div class="rail-pill"></div>${{ini2}}`;
-    el.onclick = () => {{ filterSrv(name); activateRail(el); }};
-    rail.appendChild(el);
+    // Show server icon if available, else text abbreviation
+    if (SERVER_ICONS[sid]) {{
+      el.innerHTML = `<img src="${{SERVER_ICONS[sid]}}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)" alt="">`;
+    }} else {{
+      el.innerHTML = ini2;
+    }}
+    el.onclick = (e) => {{
+      if (e.ctrlKey || e.metaKey) {{
+        // Ctrl+click → open server detail modal
+        openSrvDetail(sid, name);
+      }} else {{
+        filterSrv(name); activateRail(el);
+      }}
+    }};
+    el.addEventListener('contextmenu', (e) => {{
+      e.preventDefault();
+      openSrvDetail(sid, name);
+    }});
+    wrap.appendChild(el);
+    rail.appendChild(wrap);
   }});
 }}
 
 function activateRail(el) {{
-  document.querySelectorAll('.rail-icon').forEach(r=>r.classList.remove('active'));
-  if (el) el.classList.add('active');
+  // active class goes on rail-wrap (controls pill height) AND rail-icon (controls styles)
+  document.querySelectorAll('.rail-icon').forEach(r => {{
+    r.classList.remove('active');
+    if (r.parentElement && r.parentElement.classList.contains('rail-wrap')) {{
+      r.parentElement.classList.remove('active');
+    }}
+  }});
+  document.querySelectorAll('#rail-home-wrap').forEach(r=>r.classList.remove('active'));
+  if (el) {{
+    el.classList.add('active');
+    if (el.parentElement && el.parentElement.classList.contains('rail-wrap')) {{
+      el.parentElement.classList.add('active');
+    }}
+  }}
 }}
 
 // ── FILTERS ────────────────────────────────────────────────
@@ -3388,6 +3954,9 @@ function showHome(el) {{
   // Prevent flicker: skip re-activation if already active
   if (!el || !el.classList.contains('active')) {{
     activateRail(el);
+    // also activate the wrap for pill
+    const homeWrap = document.getElementById('rail-home-wrap');
+    if (homeWrap) homeWrap.classList.add('active');
   }}
   railSrv=null;
   applyFilters(document.getElementById('srch').value);
@@ -3902,12 +4471,12 @@ function _buildAnnotatedFragment(items) {{
           const isGif = /[.]gif$/.test(cl);
           if (isGif) {{
             body += '<div class="att-gif-wrap" onclick="openLB(\\\'' + esc(url) + '\\\')" title="Click to enlarge">'
-                  + '<img src="' + esc(url) + '" loading="lazy" onerror="this.parentElement.style.display=\\\'none\\\'">'
+                  + '<img src="' + esc(url) + '" loading="lazy" onerror="_imgExpired(this)">'
                   + '<div class="gif-play-btn">${{SVG_GIF_PLAY}}</div>'
                   + '</div>';
           }} else {{
             body += '<div class="att-img" onclick="openLB(\\\'' + esc(url) + '\\\')" title="Click to enlarge">'
-                  + '<img src="' + esc(url) + '" loading="lazy" onerror="this.parentElement.style.display=\\\'none\\\'">'
+                  + '<img src="' + esc(url) + '" loading="lazy" onerror="_imgExpired(this)">'
                   + '</div>';
           }}
         }} else if (/[.](mp4|mov|webm|mkv|m4v|avi)$/.test(cl)) {{
@@ -3919,7 +4488,8 @@ function _buildAnnotatedFragment(items) {{
     onpause="vidOnPause('${{vidId}}')"
     ontimeupdate="vidOnTime('${{vidId}}')"
     onloadedmetadata="vidOnMeta('${{vidId}}')"
-  ><source src="${{esc(url)}}"></video>
+    onerror="_vidExpired('${{vidId}}','${{esc(url)}}')"
+  ><source src="${{esc(url)}}" onerror="_vidExpired('${{vidId}}','${{esc(url)}}')" ></video>
   <button class="vid-play-btn" id="pbtn_${{vidId}}" onclick="vidTogglePlay('${{vidId}}')">${{SVG_PLAY}}</button>
   <!-- progress bar — hidden when fullscreen -->
   <div class="vid-progress-wrap" id="vprog_${{vidId}}"
@@ -4632,6 +5202,10 @@ function buildExtraSections() {{
   buildQuests();
   buildNitroHistory();
   buildOrbs();
+  buildDevAppsBadge();
+  buildHarvestHistory();
+  buildAdProfile();
+  buildSupportTickets();
 }}
 
 function showSec(id) {{
@@ -4735,11 +5309,289 @@ function buildOrbs() {{
   el.appendChild(badge);
 }}
 
+// ── DEVELOPER APPS BADGE ──────────────────────────────────────
+function buildDevAppsBadge() {{
+  if (!DEV_APPS || !DEV_APPS.length) return;
+  const el = document.getElementById('hero-badges-el');
+  if (!el) return;
+  const badge = document.createElement('div');
+  badge.className = 'hbadge hb-devapp';
+  // Build tooltip rows
+  const rows = DEV_APPS.map(a => {{
+    const botTag = a.has_bot ? `<span class="devapp-tip-bot">Bot</span>` : '';
+    return `<div class="devapp-tip-row">${{esc(a.name)}} ${{botTag}}</div>`;
+  }}).join('');
+  badge.innerHTML = `
+    <span class="badge-icon">⚙️</span>
+    <span class="badge-text">
+      <span class="badge-label">Developer Apps</span>
+      <span class="badge-value">${{DEV_APPS.length}}</span>
+    </span>
+    <div class="devapp-tooltip">${{rows}}</div>`;
+  el.appendChild(badge);
+}}
+
+
+// ── HARVEST HISTORY ────────────────────────────────────────────
+function buildHarvestHistory() {{
+  if (!HARVEST_HISTORY || !HARVEST_HISTORY.length) return;
+  showSec('sec-harvest');
+  const sumEl = document.getElementById('harvest-summary-el');
+  const n = HARVEST_HISTORY.length;
+  sumEl.innerHTML = `<div class="harvest-summary">You have requested your Discord data <strong>${{n}}</strong> time${{n!==1?'s':''}}.</div>`;
+  const el = document.getElementById('harvest-el');
+  HARVEST_HISTORY.forEach(r => {{
+    const entry = document.createElement('div');
+    entry.className = 'harvest-entry';
+    const date = (r.created_at || '').slice(0, 10);
+    const email = r.email || '';
+    let maskedEmail = '';
+    if (email) {{
+      const [local, domain] = email.split('@');
+      maskedEmail = (local.slice(0, 3) || '???') + '***@' + (domain || '?');
+    }}
+    entry.innerHTML = `
+      <div>
+        <div class="harvest-date">${{date}}</div>
+        ${{maskedEmail ? `<div class="harvest-email">${{maskedEmail}}</div>` : ''}}
+      </div>`;
+    el.appendChild(entry);
+  }});
+}}
+
+
+// ── AD PROFILE ────────────────────────────────────────────────
+function buildAdProfile() {{
+  if (!AD_TRAITS || !Object.keys(AD_TRAITS).length) return;
+  showSec('sec-adprofile');
+  const el = document.getElementById('adprofile-el');
+  const T = AD_TRAITS;
+  const nitroMap = {{1:'Nitro Classic', 2:'Nitro', 3:'Nitro Basic'}};
+
+  const gameL30  = (T.game_ids_l30  || []).length;
+  const gameL90  = (T.game_ids_l90  || []).length;
+  const gameL365 = (T.game_ids_l365 || []).length;
+  const themes   = T.theme_names_l90 || [];
+  const qEnrolled = (T.quest_history_enrolled || []).length;
+  const qClaimed  = (T.quest_history_reward_claimed || []).length;
+  const platMap = {{ desktop:'Desktop', mobile:'Mobile', web:'Web' }};
+
+  const rows = [
+    ['Age group',        T.age_group || '—'],
+    ['Primary platform', platMap[T.primary_platform_l30] || T.primary_platform_l30 || '—'],
+    ['Region',           (T.reg_region || '—') + (T.reg_country_code ? ` (${{T.reg_country_code}})` : '')],
+    ['Nitro type',       nitroMap[T.subscription_premium_type] || '—'],
+    ['Game activity',    `Discord tracked ${{gameL30}} games in the last 30 days, ${{gameL90}} in 90 days, ${{gameL365}} in 365 days`],
+    ['Quests',           `Enrolled in ${{qEnrolled}} quests / ${{qClaimed}} rewards claimed`],
+  ];
+
+  const themeHtml = themes.length
+    ? `<div class="adp-theme-wrap">${{themes.map(t=>`<span class="adp-theme">${{t}}</span>`).join('')}}</div>`
+    : '—';
+
+  el.innerHTML = `
+    <div class="adprofile-banner">This is the ad targeting profile Discord builds about you.<br>Most users are unaware this data exists.</div>
+    <div class="adprofile-card">
+      ${{rows.map(([k,v])=>`<div class="adp-row"><div class="adp-key">${{k}}</div><div class="adp-val">${{esc(String(v))}}</div></div>`).join('')}}
+      ${{themes.length ? `<div class="adp-row"><div class="adp-key">Gaming themes</div><div class="adp-val">${{themeHtml}}</div></div>` : ''}}
+    </div>`;
+}}
+
+
+// ── SUPPORT TICKETS ────────────────────────────────────────────
+function buildSupportTickets() {{
+  if (!SUPPORT_TICKETS || !Object.keys(SUPPORT_TICKETS).length) return;
+  showSec('sec-tickets');
+
+  const tickets = Object.values(SUPPORT_TICKETS);
+  tickets.sort((a, b) => (b.created_at || '') > (a.created_at || '') ? 1 : -1);
+
+  const closed  = tickets.filter(t => t.status === 'closed').length;
+  const deleted = tickets.filter(t => t.status === 'deleted').length;
+  const open    = tickets.filter(t => t.status !== 'closed' && t.status !== 'deleted').length;
+  const total   = tickets.length;
+
+  const sumEl = document.getElementById('tickets-summary-el');
+  sumEl.innerHTML = `<div class="tickets-summary">${{total}} ticket${{total!==1?'s':''}} total — ${{closed}} closed, ${{deleted}} deleted${{open?' , '+open+' open':''}}</div>`;
+
+  const el = document.getElementById('tickets-el');
+  tickets.forEach((t, idx) => {{
+    const card = document.createElement('div');
+    card.className = 'ticket-card';
+    const date    = (t.created_at || '').slice(0, 10);
+    const status  = t.status || 'open';
+    const subject = t.subject === 'SCRUBBED' ? 'Content removed by Discord' : (t.subject || '(no subject)');
+    const bodyId  = 'tc-body-' + idx;
+
+    card.innerHTML = `
+      <div class="ticket-hdr" onclick="toggleTicket('${{bodyId}}')">
+        <div class="ticket-date">${{date}}</div>
+        <div class="ticket-status ${{status}}">${{status}}</div>
+        <div class="ticket-subject">${{esc(subject)}}</div>
+      </div>
+      <div class="ticket-body" id="${{bodyId}}"></div>`;
+    el.appendChild(card);
+
+    // Sort comments ASC and populate lazily on first open
+    const bodyEl = document.getElementById(bodyId);
+    const comments = (t.comments || []).slice().sort((a, b) =>
+      (a.created_at || '') > (b.created_at || '') ? 1 : -1
+    );
+    bodyEl._rendered = false;
+    bodyEl._comments = comments;
+  }});
+}}
+
+function toggleTicket(bodyId) {{
+  const body = document.getElementById(bodyId);
+  if (!body) return;
+  const isOpen = body.classList.contains('open');
+  if (!isOpen && !body._rendered) {{
+    // Render comments on first expand
+    body._rendered = true;
+    body._comments.forEach(c => {{
+      const isUser = (c.author || '').toLowerCase() === 'user';
+      const bub = document.createElement('div');
+      bub.className = 'ticket-bubble ' + (isUser ? 'user' : 'agent');
+      const ts = (c.created_at || '').slice(0, 16).replace('T', ' ');
+      bub.innerHTML = `<div class="ticket-bubble-meta">${{esc(c.author || '?')}} · ${{ts}}</div>${{esc(c.comment || '')}}`;
+      body.appendChild(bub);
+    }});
+  }}
+  body.classList.toggle('open', !isOpen);
+}}
+
+
+// ── SERVER DETAIL ──────────────────────────────────────────────
+function openSrvDetail(sid, name) {{
+  const modal = document.getElementById('srv-detail-modal');
+  const iconEl = document.getElementById('srvd-icon-el');
+  const nameEl = document.getElementById('srvd-name-el');
+  const metaEl = document.getElementById('srvd-meta-el');
+  const chEl   = document.getElementById('srvd-ch-el');
+  const whEl   = document.getElementById('srvd-wh-el');
+  const whWrap = document.getElementById('srvd-wh-wrap');
+
+  // Server icon
+  iconEl.innerHTML = '';
+  if (SERVER_ICONS[sid]) {{
+    const img = document.createElement('img');
+    img.src = SERVER_ICONS[sid];
+    img.className = 'srv-icon-img';
+    img.style.cssText = 'width:48px;height:48px';
+    iconEl.appendChild(img);
+  }} else {{
+    const ph = document.createElement('div');
+    ph.className = 'srv-icon-placeholder';
+    ph.style.cssText = `width:48px;height:48px;background:hsl(${{srvColor(name)}},60%,38%)`;
+    ph.textContent = (name.replace(/[^a-zA-ZΑ-Ωα-ω0-9 ]/g,'').trim().split(' ').map(w=>w[0]||'').join('').toUpperCase().slice(0,2)||'?');
+    iconEl.appendChild(ph);
+  }}
+  nameEl.textContent = name;
+
+  // Channels
+  chEl.innerHTML = '';
+  const rawChs = SERVER_CHANNELS[sid] || [];
+
+  // Build channel name → message count lookup from our parsed messages
+  const chNameCount = {{}};
+  CHANNELS.filter(c => c.server === name).forEach(c => {{ chNameCount[c.name] = (chNameCount[c.name]||0) + c.count; }});
+
+  const cats = rawChs.filter(c => c.type === 4);
+  const nonCats = rawChs.filter(c => c.type !== 4);
+  const typeIco = {{ 0:'#', 2:'🔊', 5:'📢' }};
+
+  // Group by parent
+  const byParent = {{}};
+  nonCats.forEach(c => {{
+    const pid = c.parent_id || '__none__';
+    if (!byParent[pid]) byParent[pid] = [];
+    byParent[pid].push(c);
+  }});
+  // Sort within groups
+  Object.values(byParent).forEach(arr => arr.sort((a,b) => (a.position||0)-(b.position||0)));
+
+  function renderGroup(catId, catName) {{
+    if (catName) {{
+      const h = document.createElement('div');
+      h.className = 'srvd-cat';
+      h.textContent = catName;
+      chEl.appendChild(h);
+    }}
+    const group = byParent[catId] || [];
+    group.forEach(ch => {{
+      const row = document.createElement('div');
+      row.className = 'srvd-ch-row';
+      const ico = typeIco[ch.type] || '#';
+      const msgCnt = chNameCount[ch.name];
+      const badge = msgCnt ? `<span class="srvd-ch-badge">${{fmt(msgCnt)}}</span>` : '';
+      row.innerHTML = `<span class="srvd-ch-ico">${{ico}}</span><span class="srvd-ch-name">${{esc(ch.name||'')}}</span>${{badge}}`;
+      chEl.appendChild(row);
+    }});
+  }}
+
+  // Render top-level first, then each category
+  renderGroup('__none__', null);
+  cats.sort((a,b)=>(a.position||0)-(b.position||0)).forEach(cat => {{
+    renderGroup(String(cat.id), cat.name);
+  }});
+
+  const chCount = nonCats.length;
+  metaEl.textContent = `${{chCount}} channel${{chCount!==1?'s':''}}`;
+
+  // Webhooks
+  whEl.innerHTML = '';
+  const rawWHs = SERVER_WEBHOOKS[sid] || [];
+  if (rawWHs.length) {{
+    whWrap.style.display = '';
+    // Build channel id → name lookup from rawChs
+    const chIdName = {{}};
+    rawChs.forEach(c => {{ if (c.id) chIdName[String(c.id)] = c.name; }});
+    const typeLabel = {{ 1:'Incoming', 2:'Channel Follower' }};
+    rawWHs.forEach(wh => {{
+      const row = document.createElement('div');
+      row.className = 'srvd-wh-row';
+      const chName = chIdName[String(wh.channel_id)] || wh.channel_id || '—';
+      let avHtml;
+      if (wh.avatar) {{
+        avHtml = `<img class="srvd-wh-av" src="https://cdn.discordapp.com/avatars/${{wh.id}}/${{wh.avatar}}.png" alt="" loading="lazy">`;
+      }} else {{
+        avHtml = `<div class="srvd-wh-av-ph">🔗</div>`;
+      }}
+      row.innerHTML = `
+        ${{avHtml}}
+        <div class="srvd-wh-info">
+          <div class="srvd-wh-name">${{esc(wh.name||'')}}</div>
+          <div class="srvd-wh-type">${{typeLabel[wh.type]||'Webhook'}} · #${{esc(chName)}}</div>
+        </div>`;
+      whEl.appendChild(row);
+    }});
+  }} else {{
+    whWrap.style.display = 'none';
+  }}
+
+  modal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}}
+
+function closeSrvDetail() {{
+  const modal = document.getElementById('srv-detail-modal');
+  modal.style.display = 'none';
+  document.body.style.overflow = '';
+}}
+
+// Close server detail on backdrop click
+document.addEventListener('click', function(e) {{
+  const modal = document.getElementById('srv-detail-modal');
+  if (e.target === modal) closeSrvDetail();
+}});
+
+
 // ─────────────────────────────────────────────────────────────
 
 // ── SETTINGS MODAL ──────────────────────────────────────────
 
-var LANG = 'el';
+var LANG = 'en';
 
 const I18N = {{
   el: {{
@@ -4821,6 +5673,10 @@ function applyI18n() {{
     const k = el.getAttribute('data-i18n-title');
     if (L[k] !== undefined) el.title = L[k];
   }});
+  // direct el/en text on element (drp-bar, drp-footer etc.)
+  document.querySelectorAll('[data-i18n-el][data-i18n-en]').forEach(el => {{
+    el.textContent = LANG === 'el' ? el.getAttribute('data-i18n-el') : el.getAttribute('data-i18n-en');
+  }});
   // stat card labels (data-gr / data-en)
   document.querySelectorAll('[data-gr][data-en]').forEach(el => {{
     el.textContent = LANG === 'el' ? el.getAttribute('data-gr') : el.getAttribute('data-en');
@@ -4895,6 +5751,69 @@ function setLang(lang) {{
     b.classList.toggle('active', b.getAttribute('data-lang') === lang);
   }});
   applyI18n();
+}}
+
+// ── EXPIRED / 404 ATTACHMENT HANDLER ───────────────────────
+function _imgExpired(img) {{
+  try {{
+    const url  = img.src || '';
+    const raw  = url.split('/').pop() || 'image';
+    const fn   = decodeURIComponent(raw.split('?')[0]) || 'attachment';
+    const wrap = img.parentElement;
+    if (!wrap) return;
+
+    // Determine the display icon based on extension
+    const ext = fn.split('.').pop().toLowerCase();
+    const ico = ext === 'gif' ? '🎞️'
+              : /^(mp4|mov|webm|mkv)$/.test(ext) ? '🎥'
+              : /^(mp3|ogg|wav|opus|flac)$/.test(ext) ? '🎵'
+              : '🖼️';
+
+    img.style.display = 'none';
+    // Remove zoom/lightbox cursor so the placeholder link works cleanly
+    wrap.style.cursor = 'default';
+    wrap.style.background = 'none';
+    wrap.style.border = 'none';
+    wrap.style.boxShadow = 'none';
+    wrap.style.transform = 'none';
+    try {{ wrap.removeAttribute('onclick'); }} catch(e) {{}}
+    // Hide any sibling play buttons (GIF overlay, etc.)
+    wrap.querySelectorAll('.gif-play-btn,.att-tenor-overlay').forEach(el => el.style.display='none');
+
+    const ph = document.createElement('a');
+    ph.className = 'att-expired-ph';
+    ph.href = url;
+    ph.target = '_blank';
+    ph.rel = 'noopener noreferrer';
+    ph.title = 'Expired CDN link — click to try in browser';
+    ph.onclick = e => e.stopPropagation();
+    ph.innerHTML = `<span class="att-exp-ico">${{ico}}</span>`
+                 + `<span class="att-exp-name">${{fn}}</span>`
+                 + `<span class="att-exp-lbl">🚫 Unavailable · tap to try</span>`;
+    wrap.appendChild(ph);
+  }} catch(e) {{}}
+}}
+
+function _vidExpired(vidId, url) {{
+  try {{
+    const wrap = document.getElementById('wrap_' + vidId);
+    if (!wrap || wrap.dataset.expiredShown) return;
+    wrap.dataset.expiredShown = '1';
+    const raw = url.split('/').pop() || 'video';
+    const fn  = decodeURIComponent(raw.split('?')[0]) || 'video';
+    wrap.style.cssText = 'background:none;border:none;box-shadow:none';
+    wrap.innerHTML = '';
+    const ph = document.createElement('a');
+    ph.className = 'att-expired-ph';
+    ph.href = url;
+    ph.target = '_blank';
+    ph.rel = 'noopener noreferrer';
+    ph.title = 'Expired CDN link — click to try in browser';
+    ph.innerHTML = `<span class="att-exp-ico">🎥</span>`
+                 + `<span class="att-exp-name">${{fn}}</span>`
+                 + `<span class="att-exp-lbl">⏱ Expired · tap to retry</span>`;
+    wrap.appendChild(ph);
+  }} catch(e) {{}}
 }}
 
 // ── CUSTOM AUDIO PLAYER CONTROLS ───────────────────────────
@@ -5125,6 +6044,16 @@ document.addEventListener('mouseover', e => {{
 
 init();
 
+// Dismiss loading screen — small delay so browser paints the full UI first
+requestAnimationFrame(() => {{
+  requestAnimationFrame(() => {{
+    setTimeout(() => {{
+      const ls = document.getElementById('loading-screen');
+      if (ls) ls.classList.add('done');
+    }}, 120);
+  }});
+}});
+
 // close modal backdrop — after DOM is fully loaded
 window.addEventListener('load', function() {{
   const _sm = document.getElementById('settings-modal');
@@ -5143,8 +6072,8 @@ window.addEventListener('load', function() {{
       <div class="settings-row">
         <div class="settings-label" data-i18n="settings-lang">Γλώσσα</div>
         <div class="lang-options">
-          <button class="lang-opt active" data-lang="el" onclick="setLang('el')">🇬🇷 Ελληνικά</button>
-          <button class="lang-opt" data-lang="en" onclick="setLang('en')">🇬🇧 English</button>
+          <button class="lang-opt" data-lang="el" onclick="setLang('el')">🇬🇷 Ελληνικά</button>
+          <button class="lang-opt active" data-lang="en" onclick="setLang('en')">🇬🇧 English</button>
         </div>
       </div>
     </div>
@@ -5152,6 +6081,150 @@ window.addEventListener('load', function() {{
 </div>
 </body>
 </html>"""
+
+
+# ─── NEW FEATURE LOADERS ──────────────────────────────────────
+
+def load_server_icons(pkg_path, servers_idx, raw_user=None):
+    """Load server icon images as base64 data URIs, with CDN URL fallback.
+
+    Priority:
+      1. Local icon file in Servers/<guild_id>/icon.{jpeg,gif,png,webp}
+      2. Icon hash in guild_memberships → Discord CDN URL
+         (animated icons start with "a_" and get .gif extension)
+    """
+    icons = {}
+
+    # ── 1. Local icon files (base64 data URI) ──────────────────
+    for guild_id in servers_idx:
+        for ext, mime in [
+            ("jpeg", "image/jpeg"),
+            ("gif",  "image/gif"),
+            ("png",  "image/png"),
+            ("webp", "image/webp"),
+        ]:
+            p = pkg_path / "Servers" / str(guild_id) / f"icon.{ext}"
+            try:
+                if p.exists():
+                    b64 = base64.b64encode(p.read_bytes()).decode()
+                    icons[str(guild_id)] = f"data:{mime};base64,{b64}"
+                    break
+            except Exception:
+                pass
+
+    # ── 2. CDN fallback from guild_memberships in user.json ─────
+    if raw_user:
+        for gm in raw_user.get("guild_memberships", []):
+            g   = gm.get("guild", {})
+            gid = str(g.get("id") or gm.get("guild_id") or "")
+            icon_hash = g.get("icon") or ""
+            if gid and icon_hash and gid not in icons:
+                # Animated icons start with "a_" → .gif, else .png
+                ext = "gif" if icon_hash.startswith("a_") else "png"
+                icons[gid] = (
+                    f"https://cdn.discordapp.com/icons/{gid}/{icon_hash}.{ext}?size=64"
+                )
+
+    return icons
+
+
+def load_server_channels(pkg_path, servers_idx):
+    """Load channels.json for each server."""
+    result = {}
+    for guild_id in servers_idx:
+        p = pkg_path / "Servers" / str(guild_id) / "channels.json"
+        try:
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    result[str(guild_id)] = json.load(f)
+        except Exception:
+            pass
+    return result
+
+
+def load_server_webhooks(pkg_path, servers_idx):
+    """Load webhooks.json for each server (skip empty arrays)."""
+    result = {}
+    for guild_id in servers_idx:
+        p = pkg_path / "Servers" / str(guild_id) / "webhooks.json"
+        try:
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data:
+                    result[str(guild_id)] = data
+        except Exception:
+            pass
+    return result
+
+
+def load_harvest_history(pkg_path):
+    """Load data subject access request history, newest first."""
+    p = (pkg_path / "Account" / "user_data_exports"
+         / "discord_harvests" / "data_subject_access_requests.json")
+    try:
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            records = data.get("records", [])
+            records.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            return records
+    except Exception:
+        pass
+    return []
+
+
+def load_ad_traits(pkg_path):
+    """Load ad targeting traits from Ads/traits.json."""
+    p = pkg_path / "Ads" / "traits.json"
+    try:
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def load_support_tickets(pkg_path):
+    """Load support tickets dict."""
+    p = pkg_path / "Support_Tickets" / "tickets.json"
+    try:
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def load_dev_apps(pkg_path):
+    """Load developer apps from Account/applications/*/application.json."""
+    apps = []
+    apps_dir = pkg_path / "Account" / "applications"
+    if not apps_dir.exists():
+        return apps
+    for app_dir in apps_dir.iterdir():
+        if not app_dir.is_dir():
+            continue
+        p = app_dir / "application.json"
+        try:
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                app_id   = d.get("id", app_dir.name)
+                icon_hash = d.get("icon")
+                icon_url  = (f"https://cdn.discordapp.com/app-icons/{app_id}/{icon_hash}.png"
+                             if icon_hash else "")
+                apps.append({
+                    "id":       str(app_id),
+                    "name":     d.get("name", ""),
+                    "has_bot":  "bot" in d,
+                    "icon_url": icon_url,
+                })
+        except Exception:
+            pass
+    return apps
 
 
 # ─── CORE GENERATION ─────────────────────────────────────────
@@ -5274,15 +6347,33 @@ def run_generation(package_path_str, output_path_str=None):
                 user_map[aid] = aname
     print(f"User map: {len(user_map)} known users for @mention resolution")
 
+    server_icons    = load_server_icons(PACKAGE_PATH, servers, raw_user=raw_user)
+    server_channels = load_server_channels(PACKAGE_PATH, servers)
+    server_webhooks = load_server_webhooks(PACKAGE_PATH, servers)
+    harvest_history = load_harvest_history(PACKAGE_PATH)
+    ad_traits       = load_ad_traits(PACKAGE_PATH)
+    support_tickets = load_support_tickets(PACKAGE_PATH)
+    dev_apps        = load_dev_apps(PACKAGE_PATH)
+    print(f"Server icons: {len(server_icons)} | Channels: {len(server_channels)} | "
+          f"Webhooks: {len(server_webhooks)} | Harvest: {len(harvest_history)} | "
+          f"Dev apps: {len(dev_apps)}")
+
     extra = {
-        "connections":   connections,
-        "friends":       friends_data,
-        "notes":         notes,
-        "quests":        quests,
-        "nitro_history": nitro_hist,
-        "payments":      payments,
-        "orbs_balance":  orbs,
-        "user_map":      user_map,
+        "connections":     connections,
+        "friends":         friends_data,
+        "notes":           notes,
+        "quests":          quests,
+        "nitro_history":   nitro_hist,
+        "payments":        payments,
+        "orbs_balance":    orbs,
+        "user_map":        user_map,
+        "server_icons":    server_icons,
+        "server_channels": server_channels,
+        "server_webhooks": server_webhooks,
+        "harvest_history": harvest_history,
+        "ad_traits":       ad_traits,
+        "support_tickets": support_tickets,
+        "dev_apps":        dev_apps,
     }
     html = generate_html(user, servers, channels, stats, activity, av, extra, av_static=av_static)
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
