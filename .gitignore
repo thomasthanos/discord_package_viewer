@@ -2,3 +2,7 @@
 /.claude
 /__pycache__
 *.exe
+/python-creator
+/python-creator/dist
+/python-creator
+/python-creator/dist

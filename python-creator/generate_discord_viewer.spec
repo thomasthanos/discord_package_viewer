@@ -2,9 +2,9 @@
 
 
 a = Analysis(
-    ['C:\\Users\\Fuck-Windows\\Downloads\\package\\generate_discord_viewer.py'],
+    ['D:\\Projects\\discord_package_viewer\\generate_discord_viewer.py'],
     pathex=[],
-    binaries=[('C:\\Users\\Fuck-Windows\\Downloads\\package\\icon.ico', '.')],
+    binaries=[('D:\\Projects\\discord_package_viewer\\icon.ico', '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\Fuck-Windows\\Downloads\\package\\icon.ico'],
+    icon=['D:\\Projects\\discord_package_viewer\\icon.ico'],
 )
