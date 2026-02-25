@@ -4185,6 +4185,7 @@ function filterSrv(name) {{
   const railIcon = document.querySelector(`.rail-icon[data-name="${{name}}"]`);
   activateRail(railIcon);
 
+  closeMediaPanel();
   applyFilters(document.getElementById('srch').value);
 }}
 
@@ -4208,6 +4209,7 @@ function showHome(el) {{
   document.getElementById('load-area').style.display='none';
   // Close date range picker if open
   document.getElementById('date-range-picker').classList.remove('visible');
+  closeMediaPanel();
   // hide nav buttons on home screen
   const _nb = document.getElementById('nav-buttons');
   if (_nb) _nb.style.visibility = 'hidden';
